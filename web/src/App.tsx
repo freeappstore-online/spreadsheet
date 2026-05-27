@@ -322,7 +322,8 @@ export function App() {
   const setSheet = useCallback((updater: Sheet | ((prev: Sheet) => Sheet)) => {
     setWorkbook((wb) => {
       const sheets = [...wb.sheets];
-      sheets[wb.activeSheet] = typeof updater === "function" ? updater(sheets[wb.activeSheet]!) : updater;
+      const idx = wb.activeSheet;
+      sheets[idx] = typeof updater === "function" ? updater(sheets[idx]!) : updater;
       return { ...wb, sheets };
     });
   }, []);
@@ -348,8 +349,8 @@ export function App() {
   const findInputRef = useRef<HTMLInputElement>(null);
   const pendingCursorPos = useRef<number | null>(null);
   const resizingCol = useRef<{ col: number; startX: number; startW: number } | null>(null);
-  const undoStackRef = useRef<Record<string, string>[]>([]);
-  const redoStackRef = useRef<Record<string, string>[]>([]);
+  const undoStackRef = useRef<{ cells: Record<string, string>; formats: Record<string, CellFormat> }[]>([]);
+  const redoStackRef = useRef<{ cells: Record<string, string>; formats: Record<string, CellFormat> }[]>([]);
 
   // ── Persistence ─────────────────────────────────────────────────────
 
@@ -373,6 +374,27 @@ export function App() {
 
   // Auto-focus grid on mount
   useEffect(() => { gridRef.current?.focus(); }, []);
+
+  // Close popups on Escape or outside click
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (colorPicker) { setColorPicker(null); e.stopPropagation(); }
+        if (contextMenu) { setContextMenu(null); e.stopPropagation(); }
+        if (showHelp) { setShowHelp(false); e.stopPropagation(); }
+      }
+    };
+    const handleClick = () => {
+      setColorPicker(null);
+      setContextMenu(null);
+    };
+    window.addEventListener("keydown", handleKey, true);
+    window.addEventListener("mousedown", handleClick);
+    return () => {
+      window.removeEventListener("keydown", handleKey, true);
+      window.removeEventListener("mousedown", handleClick);
+    };
+  }, [colorPicker, contextMenu, showHelp]);
 
   // ── Derived state ───────────────────────────────────────────────────
 
@@ -430,24 +452,24 @@ export function App() {
   // ── Undo / Redo ─────────────────────────────────────────────────────
 
   const pushUndo = useCallback(() => {
-    undoStackRef.current = [...undoStackRef.current, { ...sheet.cells }];
+    undoStackRef.current = [...undoStackRef.current, { cells: { ...sheet.cells }, formats: { ...sheet.formats } }];
     if (undoStackRef.current.length > MAX_UNDO) undoStackRef.current.shift();
     redoStackRef.current = [];
-  }, [sheet.cells]);
+  }, [sheet.cells, sheet.formats]);
 
   const undo = useCallback(() => {
     if (undoStackRef.current.length === 0) return;
-    redoStackRef.current = [...redoStackRef.current, { ...sheet.cells }];
+    redoStackRef.current = [...redoStackRef.current, { cells: { ...sheet.cells }, formats: { ...sheet.formats } }];
     const restored = undoStackRef.current.pop()!;
-    setSheet((s) => ({ ...s, cells: restored }));
-  }, [sheet.cells]);
+    setSheet((s) => ({ ...s, cells: restored.cells, formats: restored.formats }));
+  }, [sheet.cells, sheet.formats, setSheet]);
 
   const redo = useCallback(() => {
     if (redoStackRef.current.length === 0) return;
-    undoStackRef.current = [...undoStackRef.current, { ...sheet.cells }];
+    undoStackRef.current = [...undoStackRef.current, { cells: { ...sheet.cells }, formats: { ...sheet.formats } }];
     const restored = redoStackRef.current.pop()!;
-    setSheet((s) => ({ ...s, cells: restored }));
-  }, [sheet.cells]);
+    setSheet((s) => ({ ...s, cells: restored.cells, formats: restored.formats }));
+  }, [sheet.cells, sheet.formats, setSheet]);
 
   // ── Cell mutations ──────────────────────────────────────────────────
 
@@ -652,7 +674,7 @@ export function App() {
       setSheet((prev) => { const f = { ...prev.formats }; for (const id of ids) { f[id] = { ...f[id], italic: !cur }; } return { ...prev, formats: f }; });
       return;
     }
-    if (e.key === "?" || (meta && e.key === "/")) { e.preventDefault(); setShowHelp((p) => !p); return; }
+    if (meta && e.key === "/") { e.preventDefault(); setShowHelp((p) => !p); return; }
 
     if (meta && e.key === "c") {
       e.preventDefault();
@@ -807,65 +829,50 @@ export function App() {
 
   // ── Context menu actions ─────────────────────────────────────────────
 
+  const shiftEntries = useCallback(<T,>(map: Record<string, T>, test: (p: { col: number; row: number }) => string | null): Record<string, T> => {
+    const result: Record<string, T> = {};
+    for (const [id, val] of Object.entries(map)) {
+      const p = parseCellRef(id);
+      if (!p) continue;
+      const newId = test(p);
+      if (newId) result[newId] = val;
+    }
+    return result;
+  }, []);
+
   const insertRow = useCallback((row: number, direction: "above" | "below") => {
     const targetRow = direction === "below" ? row + 1 : row;
     pushUndo();
     setSheet((prev) => {
-      const next: Record<string, string> = {};
-      for (const [id, val] of Object.entries(prev.cells)) {
-        const p = parseCellRef(id);
-        if (!p) continue;
-        if (p.row >= targetRow) next[cellId(p.col, p.row + 1)] = val;
-        else next[id] = val;
-      }
-      return { ...prev, cells: next, rowCount: prev.rowCount + 1 };
+      const shift = (p: { col: number; row: number }) => p.row >= targetRow ? cellId(p.col, p.row + 1) : cellId(p.col, p.row);
+      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), rowCount: prev.rowCount + 1 };
     });
-  }, [pushUndo]);
+  }, [pushUndo, setSheet, shiftEntries]);
 
   const deleteRow = useCallback((row: number) => {
     pushUndo();
     setSheet((prev) => {
-      const next: Record<string, string> = {};
-      for (const [id, val] of Object.entries(prev.cells)) {
-        const p = parseCellRef(id);
-        if (!p) continue;
-        if (p.row === row) continue;
-        if (p.row > row) next[cellId(p.col, p.row - 1)] = val;
-        else next[id] = val;
-      }
-      return { ...prev, cells: next, rowCount: Math.max(1, prev.rowCount - 1) };
+      const shift = (p: { col: number; row: number }) => p.row === row ? null : p.row > row ? cellId(p.col, p.row - 1) : cellId(p.col, p.row);
+      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), rowCount: Math.max(1, prev.rowCount - 1) };
     });
-  }, [pushUndo]);
+  }, [pushUndo, setSheet, shiftEntries]);
 
   const insertCol = useCallback((col: number, direction: "left" | "right") => {
     const targetCol = direction === "right" ? col + 1 : col;
     pushUndo();
     setSheet((prev) => {
-      const next: Record<string, string> = {};
-      for (const [id, val] of Object.entries(prev.cells)) {
-        const p = parseCellRef(id);
-        if (!p) continue;
-        if (p.col >= targetCol) next[cellId(p.col + 1, p.row)] = val;
-        else next[id] = val;
-      }
-      return { ...prev, cells: next, colCount: prev.colCount + 1 };
+      const shift = (p: { col: number; row: number }) => p.col >= targetCol ? cellId(p.col + 1, p.row) : cellId(p.col, p.row);
+      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), colCount: prev.colCount + 1 };
     });
-  }, [pushUndo]);
+  }, [pushUndo, setSheet, shiftEntries]);
 
   const deleteCol = useCallback((col: number) => {
     pushUndo();
     setSheet((prev) => {
-      const next: Record<string, string> = {};
-      for (const [id, val] of Object.entries(prev.cells)) {
-        const p = parseCellRef(id);
-        if (!p) continue;
-        if (p.col === col) continue;
-        if (p.col > col) next[cellId(p.col - 1, p.row)] = val;
-        else next[id] = val;
-      }
-      return { ...prev, cells: next, colCount: Math.max(1, prev.colCount - 1) };
+      const shift = (p: { col: number; row: number }) => p.col === col ? null : p.col > col ? cellId(p.col - 1, p.row) : cellId(p.col, p.row);
+      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), colCount: Math.max(1, prev.colCount - 1) };
     });
-  }, [pushUndo]);
+  }, [pushUndo, setSheet, shiftEntries]);
 
   const sortByColumn = useCallback((col: number, ascending: boolean) => {
     pushUndo();
@@ -886,15 +893,20 @@ export function App() {
         if (!isNaN(na) && !isNaN(nb)) return ascending ? na - nb : nb - na;
         return ascending ? a.sortVal.localeCompare(b.sortVal) : b.sortVal.localeCompare(a.sortVal);
       });
-      const next: Record<string, string> = {};
+      const nextCells: Record<string, string> = {};
+      const nextFormats: Record<string, CellFormat> = {};
       for (let newR = 0; newR < rows.length; newR++) {
         const oldR = rows[newR]!.row;
         for (let c = 0; c < prev.colCount; c++) {
-          const val = prev.cells[cellId(c, oldR)];
-          if (val) next[cellId(c, newR)] = val;
+          const oldId = cellId(c, oldR);
+          const newId = cellId(c, newR);
+          const val = prev.cells[oldId];
+          if (val) nextCells[newId] = val;
+          const fmt = prev.formats[oldId];
+          if (fmt) nextFormats[newId] = fmt;
         }
       }
-      return { ...prev, cells: next };
+      return { ...prev, cells: nextCells, formats: nextFormats };
     });
     setContextMenu(null);
   }, [pushUndo]);
@@ -946,17 +958,16 @@ export function App() {
   const replaceAll = useCallback(() => {
     if (!findBar.query) return;
     pushUndo();
-    const q = findBar.query;
-    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    const escaped = findBar.query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     setSheet((prev) => {
       const next = { ...prev, cells: { ...prev.cells } };
       for (const [id, raw] of Object.entries(next.cells)) {
-        if (re.test(raw)) next.cells[id] = raw.replace(re, findBar.replace);
-        re.lastIndex = 0;
+        const replaced = raw.replace(new RegExp(escaped, "gi"), findBar.replace);
+        if (replaced !== raw) next.cells[id] = replaced;
       }
       return next;
     });
-  }, [findBar.query, findBar.replace, pushUndo]);
+  }, [findBar.query, findBar.replace, pushUndo, setSheet]);
 
   const closeFindBar = useCallback(() => {
     setFindBar({ open: false, query: "", replace: "", showReplace: false });
@@ -1250,7 +1261,6 @@ export function App() {
           }}
           onFocus={() => {
             setFormulaBarFocused(true);
-            if (!editingCell) startEditing(selectedCell);
           }}
           onBlur={() => setFormulaBarFocused(false)}
           onKeyDown={handleFormulaBarKeyDown}
@@ -1381,6 +1391,7 @@ export function App() {
       {/* Color picker popup */}
       {colorPicker && (
         <div
+          onMouseDown={(e) => e.stopPropagation()}
           style={{
             position: "fixed", left: colorPicker.x, top: colorPicker.y, zIndex: 100,
             background: "var(--color-paper)", border: "1px solid var(--color-line)",
@@ -1734,6 +1745,7 @@ export function App() {
         ];
         return (
           <div
+            onMouseDown={(e) => e.stopPropagation()}
             style={{
               position: "fixed", left: contextMenu.x, top: contextMenu.y, zIndex: 100,
               background: "var(--color-paper)", border: "1px solid var(--color-line)",
@@ -1818,7 +1830,7 @@ export function App() {
                 ["Ctrl+F", "Find"],
                 ["Ctrl+H", "Find & Replace"],
                 ["Right-click", "Context menu (insert/delete/sort)"],
-                ["?", "This help"],
+                ["Ctrl+/", "This help"],
               ]],
             ].map(([title, shortcuts]) => (
               <div key={title as string} style={{ marginBottom: "0.75rem" }}>
