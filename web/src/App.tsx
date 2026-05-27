@@ -1,318 +1,11 @@
 import { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } from "react";
-
-// ── Types ──────────────────────────────────────────────────────────────
-
-interface CellFormat {
-  bold?: boolean;
-  italic?: boolean;
-  align?: "left" | "center" | "right";
-  bg?: string;
-  color?: string;
-}
-
-interface Sheet {
-  name: string;
-  cells: Record<string, string>;
-  formats: Record<string, CellFormat>;
-  colCount: number;
-  rowCount: number;
-}
-
-interface WorkbookData {
-  sheets: Sheet[];
-  activeSheet: number;
-}
-
-interface PointMode {
-  refStart: number;
-  refEnd: number;
-  anchor: { col: number; row: number };
-  active: { col: number; row: number };
-}
-
-// ── Persistence ────────────────────────────────────────────────────────
-
-const STORAGE_KEY = "spreadsheet_data";
-const DEFAULT_COLS = 26;
-const DEFAULT_ROWS = 50;
-const MAX_UNDO = 50;
-
-function makeSheet(name: string): Sheet {
-  return { name, cells: {}, formats: {}, colCount: DEFAULT_COLS, rowCount: DEFAULT_ROWS };
-}
-
-function loadWorkbook(): WorkbookData {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed.sheets) return parsed as WorkbookData;
-      // Migrate from old single-sheet format
-      return {
-        sheets: [{
-          name: "Sheet 1",
-          cells: parsed.cells ?? {},
-          formats: {},
-          colCount: parsed.colCount ?? DEFAULT_COLS,
-          rowCount: parsed.rowCount ?? DEFAULT_ROWS,
-        }],
-        activeSheet: 0,
-      };
-    }
-  } catch { /* ignore */ }
-  return { sheets: [makeSheet("Sheet 1")], activeSheet: 0 };
-}
-
-function saveWorkbook(data: WorkbookData) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-}
-
-// ── Cell reference helpers ──────────────────────────────────────────────
-
-function colLabel(index: number): string {
-  let label = "";
-  let i = index;
-  while (i >= 0) {
-    label = String.fromCharCode(65 + (i % 26)) + label;
-    i = Math.floor(i / 26) - 1;
-  }
-  return label;
-}
-
-function cellId(col: number, row: number): string {
-  return `${colLabel(col)}${row + 1}`;
-}
-
-function parseCellRef(ref: string): { col: number; row: number } | null {
-  const match = ref.match(/^([A-Z]+)(\d+)$/);
-  if (!match) return null;
-  const letters = match[1]!;
-  const rowNum = parseInt(match[2]!, 10);
-  let col = 0;
-  for (let i = 0; i < letters.length; i++) {
-    col = col * 26 + (letters.charCodeAt(i) - 64);
-  }
-  return { col: col - 1, row: rowNum - 1 };
-}
-
-function clamp(v: number, max: number) { return Math.max(0, Math.min(v, max - 1)); }
-
-// ── Formula engine ──────────────────────────────────────────────────────
-
-function expandRange(rangeStr: string): string[] {
-  const [startStr, endStr] = rangeStr.split(":");
-  if (!startStr || !endStr) return [];
-  const start = parseCellRef(startStr);
-  const end = parseCellRef(endStr);
-  if (!start || !end) return [];
-  const refs: string[] = [];
-  for (let r = Math.min(start.row, end.row); r <= Math.max(start.row, end.row); r++) {
-    for (let c = Math.min(start.col, end.col); c <= Math.max(start.col, end.col); c++) {
-      refs.push(cellId(c, r));
-    }
-  }
-  return refs;
-}
-
-function evaluateFormula(
-  formula: string,
-  cells: Record<string, string>,
-  visited: Set<string>,
-  currentCell: string,
-): string {
-  if (visited.has(currentCell)) return "#CIRC!";
-  visited.add(currentCell);
-  const expr = formula.slice(1).trim();
-
-  const resolveRef = (ref: string): number => {
-    const raw = cells[ref] ?? "";
-    if (!raw) return 0;
-    const val = raw.startsWith("=")
-      ? evaluateFormula(raw, cells, new Set(visited), ref)
-      : raw;
-    const num = parseFloat(val);
-    return isNaN(num) ? 0 : num;
-  };
-
-  const resolveRefs = (arg: string): number[] => {
-    arg = arg.trim();
-    if (arg.includes(":")) return expandRange(arg).map(resolveRef);
-    return [resolveRef(arg)];
-  };
-
-  // Match function calls — find the outermost FUNC(...) pattern
-  const fnStart = expr.match(/^([A-Z]+)\(/i);
-  if (fnStart && expr.endsWith(")")) {
-    const fn = fnStart[1]!.toUpperCase();
-    const inner = expr.slice(fnStart[0].length, -1);
-    const args = splitArgs(inner);
-    const evalArg = (a: string) => evaluateExpression(a.trim(), cells, visited, currentCell);
-    const numArg = (a: string) => { const v = parseFloat(evalArg(a)); return isNaN(v) ? 0 : v; };
-
-    switch (fn) {
-      case "SUM": return String(args.flatMap(resolveRefs).reduce((a, b) => a + b, 0));
-      case "AVG": case "AVERAGE": {
-        const nums = args.flatMap(resolveRefs);
-        return nums.length === 0 ? "#DIV/0!" : String(nums.reduce((a, b) => a + b, 0) / nums.length);
-      }
-      case "MIN": { const n = args.flatMap(resolveRefs); return n.length ? String(Math.min(...n)) : "0"; }
-      case "MAX": { const n = args.flatMap(resolveRefs); return n.length ? String(Math.max(...n)) : "0"; }
-      case "COUNT": return String(args.flatMap(resolveRefs).filter((n) => n !== 0).length);
-      case "COUNTA": return String(args.flatMap((a) => {
-        a = a.trim();
-        if (a.includes(":")) return expandRange(a).map((r) => cells[r] ?? "");
-        return [cells[a] ?? ""];
-      }).filter((v) => v !== "").length);
-      case "IF": {
-        if (args.length < 2) return "#ARG!";
-        const cond = evalArg(args[0]!);
-        const condNum = parseFloat(cond);
-        const truthy = !isNaN(condNum) ? condNum !== 0 : cond.length > 0;
-        if (truthy) return args[1] ? evalArg(args[1]) : "1";
-        return args[2] ? evalArg(args[2]) : "0";
-      }
-      case "ABS": return args.length < 1 ? "#ARG!" : String(Math.abs(numArg(args[0]!)));
-      case "ROUND": {
-        const val = numArg(args[0] ?? "0");
-        const dec = args[1] ? numArg(args[1]) : 0;
-        const f = Math.pow(10, dec);
-        return String(Math.round(val * f) / f);
-      }
-      case "FLOOR": return String(Math.floor(numArg(args[0] ?? "0")));
-      case "CEIL": case "CEILING": return String(Math.ceil(numArg(args[0] ?? "0")));
-      case "SQRT": { const v = numArg(args[0] ?? "0"); return v < 0 ? "#NUM!" : String(Math.sqrt(v)); }
-      case "POWER": case "POW": return String(Math.pow(numArg(args[0] ?? "0"), numArg(args[1] ?? "1")));
-      case "MOD": { const d = numArg(args[1] ?? "0"); return d === 0 ? "#DIV/0!" : String(numArg(args[0] ?? "0") % d); }
-      case "LEN": return String(evalArg(args[0] ?? "").length);
-      case "UPPER": return evalArg(args[0] ?? "").toUpperCase();
-      case "LOWER": return evalArg(args[0] ?? "").toLowerCase();
-      case "TRIM": return evalArg(args[0] ?? "").trim();
-      case "LEFT": return evalArg(args[0] ?? "").slice(0, numArg(args[1] ?? "1"));
-      case "RIGHT": { const s = evalArg(args[0] ?? ""); return s.slice(-numArg(args[1] ?? "1")); }
-      case "MID": { const s = evalArg(args[0] ?? ""); return s.slice(numArg(args[1] ?? "1") - 1, numArg(args[1] ?? "1") - 1 + numArg(args[2] ?? "1")); }
-      case "CONCATENATE": case "CONCAT": return args.map((a) => evalArg(a)).join("");
-      case "SUBSTITUTE": {
-        const text = evalArg(args[0] ?? "");
-        const old = evalArg(args[1] ?? "");
-        const repl = evalArg(args[2] ?? "");
-        return text.split(old).join(repl);
-      }
-      case "TEXT": return evalArg(args[0] ?? "");
-      case "VALUE": { const v = parseFloat(evalArg(args[0] ?? "")); return isNaN(v) ? "#VALUE!" : String(v); }
-      case "INT": return String(Math.trunc(numArg(args[0] ?? "0")));
-      case "SIGN": { const v = numArg(args[0] ?? "0"); return String(v > 0 ? 1 : v < 0 ? -1 : 0); }
-      case "PI": return String(Math.PI);
-      case "NOW": return new Date().toLocaleString();
-      case "TODAY": return new Date().toLocaleDateString();
-      default: return "#NAME!";
-    }
-  }
-
-  // Unmatched parens or plain expression
-  let depth = 0;
-  for (const ch of expr) { if (ch === "(") depth++; if (ch === ")") depth--; }
-  if (depth !== 0) return "#PAREN!";
-
-  return evaluateExpression(expr, cells, visited, currentCell);
-}
-
-function splitArgs(str: string): string[] {
-  const args: string[] = [];
-  let depth = 0;
-  let current = "";
-  for (const ch of str) {
-    if (ch === "(") depth++;
-    else if (ch === ")") depth--;
-    if (ch === "," && depth === 0) { args.push(current); current = ""; }
-    else current += ch;
-  }
-  if (current) args.push(current);
-  return args;
-}
-
-function evaluateExpression(
-  expr: string,
-  cells: Record<string, string>,
-  visited: Set<string>,
-  _currentCell: string,
-): string {
-  let resolved = expr.trim();
-  resolved = resolved.replace(/\b([A-Z]+\d+)\b/gi, (match) => {
-    const ref = match.toUpperCase();
-    const raw = cells[ref] ?? "";
-    if (!raw) return "0";
-    if (raw.startsWith("=")) return evaluateFormula(raw, cells, new Set(visited), ref);
-    return raw;
-  });
-  try {
-    if (/^[\d\s+\-*/().%<>=!&|]+$/.test(resolved)) {
-      resolved = resolved.replace(/(?<!=)=(?!=)/g, "==");
-      const result = new Function(`"use strict"; return (${resolved})`)() as number | boolean;
-      if (typeof result === "boolean") return result ? "1" : "0";
-      if (typeof result === "number") {
-        if (!isFinite(result)) return "#DIV/0!";
-        return String(Math.round(result * 1e10) / 1e10);
-      }
-      return String(result);
-    }
-    return resolved;
-  } catch { return "#ERROR!"; }
-}
-
-function computeDisplay(id: string, cells: Record<string, string>): string {
-  const raw = cells[id];
-  if (!raw) return "";
-  if (!raw.startsWith("=")) return raw;
-  return evaluateFormula(raw, cells, new Set(), id);
-}
-
-// ── CSV parsing ────────────────────────────────────────────────────────
-
-function parseCsvLine(line: string, sep: string): string[] {
-  const result: string[] = [];
-  let current = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i]!;
-    if (inQuotes) {
-      if (ch === '"' && line[i + 1] === '"') { current += '"'; i++; }
-      else if (ch === '"') inQuotes = false;
-      else current += ch;
-    } else {
-      if (ch === '"') inQuotes = true;
-      else if (ch === sep) { result.push(current); current = ""; }
-      else current += ch;
-    }
-  }
-  result.push(current);
-  return result;
-}
-
-// ── Point mode helpers ─────────────────────────────────────────────────
-
-const REF_TRIGGERS = new Set(["=", "(", ",", "+", "-", "*", "/", "<", ">", "^", "%", "&", "|", "!", ":"]);
-
-function isRefPosition(value: string, cursorPos: number): boolean {
-  if (!value.startsWith("=")) return false;
-  if (cursorPos === 0) return false;
-  for (let i = cursorPos - 1; i >= 0; i--) {
-    const ch = value[i]!;
-    if (ch === " ") continue;
-    return REF_TRIGGERS.has(ch);
-  }
-  return true;
-}
-
-function buildRefString(pm: PointMode): string {
-  const a = pm.anchor;
-  const b = pm.active;
-  if (a.col === b.col && a.row === b.row) return cellId(a.col, a.row);
-  return `${cellId(Math.min(a.col, b.col), Math.min(a.row, b.row))}:${cellId(Math.max(a.col, b.col), Math.max(a.row, b.row))}`;
-}
-
-function splice(str: string, start: number, end: number, insert: string): string {
-  return str.slice(0, start) + insert + str.slice(end);
-}
+import type { CellFormat, Sheet, WorkbookData, PointMode } from "./types";
+import { DEFAULT_COLS, DEFAULT_ROWS, MAX_UNDO } from "./constants";
+import { colLabel, cellId, parseCellRef, clamp } from "./lib/cell-refs";
+import { computeDisplay } from "./lib/formula-engine";
+import { parseCsvLine } from "./lib/csv";
+import { isRefPosition, buildRefString, splice } from "./lib/point-mode";
+import { makeSheet, loadWorkbook, saveWorkbook } from "./lib/persistence";
 
 // ── App ────────────────────────────────────────────────────────────────
 
@@ -1174,12 +867,53 @@ export function App() {
     return val;
   }, []);
 
-  // ── Render helpers ──────────────────────────────────────────────────
+  // ── Virtualization ───────────────────────────────────────────────────
 
-  const isError = (val: string) => val.startsWith("#");
+  const [scrollTop, setScrollTop] = useState(0);
+  const [gridHeight, setGridHeight] = useState(600);
+  const BUFFER = 5;
   const COL_WIDTH = 100;
   const ROW_HEIGHT = 28;
   const HEADER_WIDTH = 44;
+
+  const firstVisible = Math.floor(scrollTop / ROW_HEIGHT);
+  const visibleCount = Math.ceil(gridHeight / ROW_HEIGHT);
+  const startRow = Math.max(0, firstVisible - BUFFER);
+  const endRow = Math.min(sheet.rowCount - 1, firstVisible + visibleCount + BUFFER);
+
+  // Always include the editing row in the rendered range
+  const editingRow = editingCell ? (parseCellRef(editingCell)?.row ?? null) : null;
+
+  const handleGridScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    setScrollTop(e.currentTarget.scrollTop);
+  }, []);
+
+  // Track grid container height
+  useEffect(() => {
+    const el = gridRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) setGridHeight(entry.contentRect.height);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Scroll selected cell into view
+  useEffect(() => {
+    const parsed = parseCellRef(selectedCell);
+    if (!parsed || !gridRef.current) return;
+    const cellTop = (parsed.row + 1) * ROW_HEIGHT;
+    const cellBottom = cellTop + ROW_HEIGHT;
+    const viewTop = gridRef.current.scrollTop + ROW_HEIGHT;
+    const viewBottom = gridRef.current.scrollTop + gridHeight;
+    if (cellTop < viewTop) gridRef.current.scrollTop = cellTop - ROW_HEIGHT;
+    else if (cellBottom > viewBottom) gridRef.current.scrollTop = cellBottom - gridHeight;
+  }, [selectedCell, gridHeight]);
+
+  // ── Render helpers ──────────────────────────────────────────────────
+
+  const isError = (val: string) => val.startsWith("#");
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100dvh" }}>
@@ -1423,178 +1157,182 @@ export function App() {
         </div>
       )}
 
-      {/* Grid */}
+      {/* Grid — virtualized rows */}
       <div
         ref={gridRef}
         tabIndex={0}
         onKeyDown={handleGridKeyDown}
+        onScroll={handleGridScroll}
         onClick={() => setContextMenu(null)}
         onContextMenu={(e) => e.preventDefault()}
         style={{ flex: 1, overflow: "auto", outline: "none", position: "relative" }}
       >
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: `${HEADER_WIDTH}px ${Array.from({ length: sheet.colCount }, (_, c) => `${getColWidth(c)}px`).join(" ")}`,
-            gridTemplateRows: `${ROW_HEIGHT}px repeat(${sheet.rowCount}, ${ROW_HEIGHT}px)`,
-            width: "fit-content",
-            minWidth: "100%",
-          }}
-        >
-          {/* Corner */}
-          <div style={{
-            position: "sticky", top: 0, left: 0, zIndex: 3,
-            background: "var(--color-panel)",
-            borderBottom: "2px solid var(--color-line)",
-            borderRight: "1px solid var(--color-line)",
-          }} />
+        {(() => {
+          const totalW = HEADER_WIDTH + Array.from({ length: sheet.colCount }, (_, c) => getColWidth(c)).reduce((a, b) => a + b, 0);
+          const totalH = (sheet.rowCount + 1) * ROW_HEIGHT;
+          const findSet = new Set(findMatches);
+          const currentMatch = findMatches[findIndex];
 
-          {/* Column headers with resize handles */}
-          {Array.from({ length: sheet.colCount }, (_, c) => {
-            const colSel = selectionRange
-              ? c >= selectionRange.minC && c <= selectionRange.maxC
-              : parseCellRef(selectedCell)?.col === c;
-            return (
-              <div
-                key={`ch-${c}`}
-                style={{
-                  position: "sticky", top: 0, zIndex: 2,
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  background: colSel ? "var(--color-line)" : "var(--color-panel)",
+          return (
+            <div style={{ width: totalW, height: totalH, position: "relative", minWidth: "100%" }}>
+              {/* Column headers — sticky */}
+              <div style={{ position: "sticky", top: 0, zIndex: 10, display: "flex", height: ROW_HEIGHT }}>
+                <div style={{
+                  position: "sticky", left: 0, zIndex: 3, width: HEADER_WIDTH, flexShrink: 0,
+                  background: "var(--color-panel)",
                   borderBottom: "2px solid var(--color-line)",
                   borderRight: "1px solid var(--color-line)",
-                  fontSize: "0.6875rem", fontWeight: 600,
-                  color: colSel ? "var(--color-ink)" : "var(--color-muted)",
-                  userSelect: "none",
-                }}
-              >
-                {colLabel(c)}
-                <div
-                  onMouseDown={(e) => handleColResizeStart(c, e)}
-                  onDoubleClick={() => handleColResizeDoubleClick(c)}
-                  style={{
-                    position: "absolute", right: -2, top: 0, bottom: 0, width: 5,
-                    cursor: "col-resize", zIndex: 4,
-                  }}
-                />
-              </div>
-            );
-          })}
-
-          {/* Rows */}
-          {Array.from({ length: sheet.rowCount }, (_, r) => {
-            const rowSel = selectionRange
-              ? r >= selectionRange.minR && r <= selectionRange.maxR
-              : parseCellRef(selectedCell)?.row === r;
-            return (
-              <>
-                {/* Row header */}
-                <div
-                  key={`rh-${r}`}
-                  style={{
-                    position: "sticky", left: 0, zIndex: 1,
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    background: rowSel ? "var(--color-line)" : "var(--color-panel)",
-                    borderBottom: "1px solid var(--color-line)",
-                    borderRight: "1px solid var(--color-line)",
-                    fontSize: "0.6875rem", fontWeight: 500,
-                    color: rowSel ? "var(--color-ink)" : "var(--color-muted)",
-                    userSelect: "none",
-                  }}
-                >
-                  {r + 1}
-                </div>
-
-                {/* Cells */}
+                }} />
                 {Array.from({ length: sheet.colCount }, (_, c) => {
-                  const id = cellId(c, r);
-                  const isSelected = selectedCell === id;
-                  const isEditing = editingCell === id;
-                  const isPointed = pointHighlight.has(id);
-                  const inRange = selectionRange?.cells.has(id) ?? false;
-                  const display = displayValues[id] ?? "";
-                  const fmt = sheet.formats[id];
-                  const isNum = !isNaN(parseFloat(display)) && display !== "" && !isError(display);
-                  const isFindMatch = findMatches.includes(id);
-                  const isCurrentMatch = isFindMatch && findMatches[findIndex] === id;
-                  const zebraColor = r % 2 === 1 ? "var(--color-zebra)" : undefined;
-
+                  const colSel = selectionRange
+                    ? c >= selectionRange.minC && c <= selectionRange.maxC
+                    : parseCellRef(selectedCell)?.col === c;
+                  const w = getColWidth(c);
                   return (
                     <div
-                      key={id}
-                      onMouseDown={(e) => handleCellMouseDown(id, e)}
-                      onDoubleClick={() => { if (!editingCell) startEditing(id); }}
-                      onContextMenu={(e) => {
-                        e.preventDefault(); e.stopPropagation();
-                        select(id);
-                        setContextMenu({ x: e.clientX, y: e.clientY, cellId: id });
-                      }}
+                      key={c}
                       style={{
-                        position: "relative",
-                        borderBottom: "1px solid var(--color-line)",
+                        width: w, flexShrink: 0, position: "relative",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        background: colSel ? "var(--color-line)" : "var(--color-panel)",
+                        borderBottom: "2px solid var(--color-line)",
                         borderRight: "1px solid var(--color-line)",
-                        outline: isSelected
-                          ? "2px solid var(--color-accent)"
-                          : isPointed
-                            ? "2px solid #5b8cd6"
-                            : "none",
-                        outlineOffset: "-1px",
-                        background: isCurrentMatch
-                          ? "rgba(255,180,0,0.35)"
-                          : isFindMatch
-                            ? "rgba(255,220,80,0.2)"
-                            : isPointed && !isSelected
-                              ? "rgba(91,140,214,0.12)"
-                              : inRange && !isSelected
-                                ? "rgba(192,133,82,0.10)"
-                                : fmt?.bg ?? zebraColor,
-                        zIndex: isSelected || isPointed ? 1 : 0,
-                        cursor: "cell",
+                        fontSize: "0.6875rem", fontWeight: 600,
+                        color: colSel ? "var(--color-ink)" : "var(--color-muted)",
+                        userSelect: "none",
                       }}
                     >
-                      {isEditing ? (
-                        <input
-                          ref={editInputRef}
-                          value={editValue}
-                          onChange={(e) => {
-                            if (pointMode) setPointMode(null);
-                            setEditValue(e.target.value);
-                          }}
-                          onKeyDown={handleInputKeyDown}
-                          style={{
-                            position: "absolute", inset: 0,
-                            border: "none", outline: "none",
-                            background: "var(--color-paper)",
-                            padding: "0 4px", fontSize: "0.8125rem",
-                            color: "var(--color-ink)",
-                            width: "100%", height: "100%",
-                          }}
-                        />
-                      ) : (
-                        <div
-                          style={{
-                            padding: "0 4px",
-                            fontSize: "0.8125rem",
-                            lineHeight: `${ROW_HEIGHT}px`,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                            color: isError(display) ? "#d94040" : fmt?.color ?? "var(--color-ink)",
-                            textAlign: fmt?.align ?? (isNum ? "right" : "left"),
-                            fontWeight: fmt?.bold ? 700 : isError(display) ? 600 : 400,
-                            fontStyle: fmt?.italic ? "italic" : undefined,
-                          }}
-                        >
-                          {formatDisplay(display)}
-                        </div>
-                      )}
+                      {colLabel(c)}
+                      <div
+                        onMouseDown={(e) => handleColResizeStart(c, e)}
+                        onDoubleClick={() => handleColResizeDoubleClick(c)}
+                        style={{ position: "absolute", right: -2, top: 0, bottom: 0, width: 5, cursor: "col-resize", zIndex: 4 }}
+                      />
                     </div>
                   );
                 })}
-              </>
-            );
-          })}
-        </div>
+              </div>
+
+              {/* Virtualized data rows */}
+              {Array.from({ length: endRow - startRow + 1 }, (_, i) => {
+                const r = startRow + i;
+                if (editingRow !== null && r !== editingRow && r === endRow && editingRow > endRow) return null;
+                const rowSel = selectionRange
+                  ? r >= selectionRange.minR && r <= selectionRange.maxR
+                  : parseCellRef(selectedCell)?.row === r;
+                return (
+                  <div key={r} style={{ position: "absolute", top: (r + 1) * ROW_HEIGHT, left: 0, height: ROW_HEIGHT, display: "flex", width: totalW }}>
+                    <div style={{
+                      position: "sticky", left: 0, zIndex: 1, width: HEADER_WIDTH, flexShrink: 0,
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      background: rowSel ? "var(--color-line)" : "var(--color-panel)",
+                      borderBottom: "1px solid var(--color-line)",
+                      borderRight: "1px solid var(--color-line)",
+                      fontSize: "0.6875rem", fontWeight: 500,
+                      color: rowSel ? "var(--color-ink)" : "var(--color-muted)",
+                      userSelect: "none",
+                    }}>
+                      {r + 1}
+                    </div>
+                    {Array.from({ length: sheet.colCount }, (_, c) => {
+                      const id = cellId(c, r);
+                      const isSelected = selectedCell === id;
+                      const isEditing = editingCell === id;
+                      const isPointed = pointHighlight.has(id);
+                      const inRange = selectionRange?.cells.has(id) ?? false;
+                      const display = displayValues[id] ?? "";
+                      const fmt = sheet.formats[id];
+                      const isNum = !isNaN(parseFloat(display)) && display !== "" && !isError(display);
+                      const isFindMatch = findSet.has(id);
+                      const isCurrentMatch = id === currentMatch;
+                      const zebraColor = r % 2 === 1 ? "var(--color-zebra)" : undefined;
+                      const w = getColWidth(c);
+
+                      return (
+                        <div
+                          key={c}
+                          onMouseDown={(e) => handleCellMouseDown(id, e)}
+                          onDoubleClick={() => { if (!editingCell) startEditing(id); }}
+                          onContextMenu={(e) => {
+                            e.preventDefault(); e.stopPropagation();
+                            select(id);
+                            setContextMenu({ x: e.clientX, y: e.clientY, cellId: id });
+                          }}
+                          style={{
+                            width: w, flexShrink: 0, position: "relative",
+                            borderBottom: "1px solid var(--color-line)",
+                            borderRight: "1px solid var(--color-line)",
+                            outline: isSelected ? "2px solid var(--color-accent)" : isPointed ? "2px solid #5b8cd6" : "none",
+                            outlineOffset: "-1px",
+                            background: isCurrentMatch ? "rgba(255,180,0,0.35)"
+                              : isFindMatch ? "rgba(255,220,80,0.2)"
+                              : isPointed && !isSelected ? "rgba(91,140,214,0.12)"
+                              : inRange && !isSelected ? "rgba(192,133,82,0.10)"
+                              : fmt?.bg ?? zebraColor,
+                            zIndex: isSelected || isPointed ? 1 : 0,
+                            cursor: "cell",
+                          }}
+                        >
+                          {isEditing ? (
+                            <input
+                              ref={editInputRef}
+                              value={editValue}
+                              onChange={(e) => { if (pointMode) setPointMode(null); setEditValue(e.target.value); }}
+                              onKeyDown={handleInputKeyDown}
+                              style={{
+                                position: "absolute", inset: 0, border: "none", outline: "none",
+                                background: "var(--color-paper)", padding: "0 4px", fontSize: "0.8125rem",
+                                color: "var(--color-ink)", width: "100%", height: "100%",
+                              }}
+                            />
+                          ) : (
+                            <div style={{
+                              padding: "0 4px", fontSize: "0.8125rem", lineHeight: `${ROW_HEIGHT}px`,
+                              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                              color: isError(display) ? "#d94040" : fmt?.color ?? "var(--color-ink)",
+                              textAlign: fmt?.align ?? (isNum ? "right" : "left"),
+                              fontWeight: fmt?.bold ? 700 : isError(display) ? 600 : 400,
+                              fontStyle: fmt?.italic ? "italic" : undefined,
+                            }}>
+                              {formatDisplay(display)}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+
+              {/* Render editing row if off-screen */}
+              {editingRow !== null && (editingRow < startRow || editingRow > endRow) && (() => {
+                const r = editingRow;
+                return (
+                  <div key={`edit-${r}`} style={{ position: "absolute", top: (r + 1) * ROW_HEIGHT, left: 0, height: ROW_HEIGHT, display: "flex", width: totalW }}>
+                    <div style={{ position: "sticky", left: 0, zIndex: 1, width: HEADER_WIDTH, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "var(--color-panel)", borderBottom: "1px solid var(--color-line)", borderRight: "1px solid var(--color-line)", fontSize: "0.6875rem", color: "var(--color-muted)", userSelect: "none" }}>
+                      {r + 1}
+                    </div>
+                    {Array.from({ length: sheet.colCount }, (_, c) => {
+                      const id = cellId(c, r);
+                      const isEditing = editingCell === id;
+                      return (
+                        <div key={c} style={{ width: getColWidth(c), flexShrink: 0, position: "relative", borderBottom: "1px solid var(--color-line)", borderRight: "1px solid var(--color-line)" }}>
+                          {isEditing && (
+                            <input ref={editInputRef} value={editValue}
+                              onChange={(e) => { if (pointMode) setPointMode(null); setEditValue(e.target.value); }}
+                              onKeyDown={handleInputKeyDown}
+                              style={{ position: "absolute", inset: 0, border: "none", outline: "none", background: "var(--color-paper)", padding: "0 4px", fontSize: "0.8125rem", color: "var(--color-ink)", width: "100%", height: "100%" }}
+                            />
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+            </div>
+          );
+        })()}
       </div>
 
       {/* Find bar */}

@@ -13,7 +13,8 @@
   "scripts": {
     "dev": "pnpm --filter @freespreadsheetapp/web dev",
     "build": "pnpm --filter @freespreadsheetapp/web build",
-    "test": "pnpm --filter @freespreadsheetapp/web exec tsc -b"
+    "test": "pnpm --filter @freespreadsheetapp/web test",
+    "typecheck": "pnpm --filter @freespreadsheetapp/web exec tsc -b"
   },
   "repository": {
     "type": "git",
