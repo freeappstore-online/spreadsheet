@@ -300,14 +300,20 @@ export function App() {
   const [formulaBarFocused, setFormulaBarFocused] = useState(false);
   const [pointMode, setPointMode] = useState<PointMode | null>(null);
   const [clipboard, setClipboard] = useState<{ type: "copy" | "cut"; ids: string[]; values: Record<string, string> } | null>(null);
-  const [, setUndoStack] = useState<Record<string, string>[]>([]);
   const [colWidths, setColWidths] = useState<Record<number, number>>({});
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; cellId: string } | null>(null);
+  const [findBar, setFindBar] = useState<{ open: boolean; query: string; replace: string; showReplace: boolean }>({ open: false, query: "", replace: "", showReplace: false });
+  const [findMatches, setFindMatches] = useState<string[]>([]);
+  const [findIndex, setFindIndex] = useState(0);
 
   const editInputRef = useRef<HTMLInputElement>(null);
   const formulaBarRef = useRef<HTMLInputElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
+  const findInputRef = useRef<HTMLInputElement>(null);
   const pendingCursorPos = useRef<number | null>(null);
   const resizingCol = useRef<{ col: number; startX: number; startW: number } | null>(null);
+  const undoStackRef = useRef<Record<string, string>[]>([]);
+  const redoStackRef = useRef<Record<string, string>[]>([]);
 
   // ── Persistence ─────────────────────────────────────────────────────
 
@@ -385,25 +391,27 @@ export function App() {
     return { sum, avg: sum / nums.length, count, numCount: nums.length };
   }, [selectedCell, selectionRange, displayValues]);
 
-  // ── Undo ────────────────────────────────────────────────────────────
+  // ── Undo / Redo ─────────────────────────────────────────────────────
 
   const pushUndo = useCallback(() => {
-    setUndoStack((prev) => {
-      const next = [...prev, { ...sheet.cells }];
-      if (next.length > MAX_UNDO) next.shift();
-      return next;
-    });
+    undoStackRef.current = [...undoStackRef.current, { ...sheet.cells }];
+    if (undoStackRef.current.length > MAX_UNDO) undoStackRef.current.shift();
+    redoStackRef.current = [];
   }, [sheet.cells]);
 
   const undo = useCallback(() => {
-    setUndoStack((prev) => {
-      if (prev.length === 0) return prev;
-      const next = [...prev];
-      const restored = next.pop()!;
-      setSheet((s) => ({ ...s, cells: restored }));
-      return next;
-    });
-  }, []);
+    if (undoStackRef.current.length === 0) return;
+    redoStackRef.current = [...redoStackRef.current, { ...sheet.cells }];
+    const restored = undoStackRef.current.pop()!;
+    setSheet((s) => ({ ...s, cells: restored }));
+  }, [sheet.cells]);
+
+  const redo = useCallback(() => {
+    if (redoStackRef.current.length === 0) return;
+    undoStackRef.current = [...undoStackRef.current, { ...sheet.cells }];
+    const restored = redoStackRef.current.pop()!;
+    setSheet((s) => ({ ...s, cells: restored }));
+  }, [sheet.cells]);
 
   // ── Cell mutations ──────────────────────────────────────────────────
 
@@ -590,7 +598,10 @@ export function App() {
     // This handler only fires when the grid itself has focus (not editing).
     const meta = e.metaKey || e.ctrlKey;
 
-    if (meta && e.key === "z") { e.preventDefault(); undo(); return; }
+    if (meta && e.key === "z" && !e.shiftKey) { e.preventDefault(); undo(); return; }
+    if (meta && (e.key === "y" || (e.key === "z" && e.shiftKey))) { e.preventDefault(); redo(); return; }
+    if (meta && e.key === "f") { e.preventDefault(); setFindBar((p) => ({ ...p, open: true })); requestAnimationFrame(() => findInputRef.current?.focus()); return; }
+    if (meta && e.key === "h") { e.preventDefault(); setFindBar((p) => ({ ...p, open: true, showReplace: true })); requestAnimationFrame(() => findInputRef.current?.focus()); return; }
 
     if (meta && e.key === "c") {
       e.preventDefault();
@@ -669,7 +680,7 @@ export function App() {
           startEditing(selectedCell, e.key);
         }
     }
-  }, [selectedCell, selectionRange, sheet.cells, sheet.colCount, sheet.rowCount, clipboard, move, extendSelection, startEditing, writeCell, pushUndo, undo]);
+  }, [selectedCell, selectionRange, sheet.cells, sheet.colCount, sheet.rowCount, clipboard, move, extendSelection, startEditing, writeCell, pushUndo, undo, redo]);
 
   // ── Keyboard: inline cell input ─────────────────────────────────────
 
@@ -742,6 +753,165 @@ export function App() {
       gridRef.current?.focus();
     }
   }, [editingCell, selectedCell, formulaBarValue, sheet.cells, commitEdit, cancelEdit, pushUndo]);
+
+  // ── Context menu actions ─────────────────────────────────────────────
+
+  const insertRow = useCallback((row: number, direction: "above" | "below") => {
+    const targetRow = direction === "below" ? row + 1 : row;
+    pushUndo();
+    setSheet((prev) => {
+      const next: Record<string, string> = {};
+      for (const [id, val] of Object.entries(prev.cells)) {
+        const p = parseCellRef(id);
+        if (!p) continue;
+        if (p.row >= targetRow) next[cellId(p.col, p.row + 1)] = val;
+        else next[id] = val;
+      }
+      return { ...prev, cells: next, rowCount: prev.rowCount + 1 };
+    });
+  }, [pushUndo]);
+
+  const deleteRow = useCallback((row: number) => {
+    pushUndo();
+    setSheet((prev) => {
+      const next: Record<string, string> = {};
+      for (const [id, val] of Object.entries(prev.cells)) {
+        const p = parseCellRef(id);
+        if (!p) continue;
+        if (p.row === row) continue;
+        if (p.row > row) next[cellId(p.col, p.row - 1)] = val;
+        else next[id] = val;
+      }
+      return { ...prev, cells: next, rowCount: Math.max(1, prev.rowCount - 1) };
+    });
+  }, [pushUndo]);
+
+  const insertCol = useCallback((col: number, direction: "left" | "right") => {
+    const targetCol = direction === "right" ? col + 1 : col;
+    pushUndo();
+    setSheet((prev) => {
+      const next: Record<string, string> = {};
+      for (const [id, val] of Object.entries(prev.cells)) {
+        const p = parseCellRef(id);
+        if (!p) continue;
+        if (p.col >= targetCol) next[cellId(p.col + 1, p.row)] = val;
+        else next[id] = val;
+      }
+      return { ...prev, cells: next, colCount: prev.colCount + 1 };
+    });
+  }, [pushUndo]);
+
+  const deleteCol = useCallback((col: number) => {
+    pushUndo();
+    setSheet((prev) => {
+      const next: Record<string, string> = {};
+      for (const [id, val] of Object.entries(prev.cells)) {
+        const p = parseCellRef(id);
+        if (!p) continue;
+        if (p.col === col) continue;
+        if (p.col > col) next[cellId(p.col - 1, p.row)] = val;
+        else next[id] = val;
+      }
+      return { ...prev, cells: next, colCount: Math.max(1, prev.colCount - 1) };
+    });
+  }, [pushUndo]);
+
+  const sortByColumn = useCallback((col: number, ascending: boolean) => {
+    pushUndo();
+    setSheet((prev) => {
+      const rows: { row: number; sortVal: string }[] = [];
+      for (let r = 0; r < prev.rowCount; r++) {
+        const id = cellId(col, r);
+        const raw = prev.cells[id] ?? "";
+        const display = raw.startsWith("=") ? computeDisplay(id, prev.cells) : raw;
+        rows.push({ row: r, sortVal: display });
+      }
+      rows.sort((a, b) => {
+        const na = parseFloat(a.sortVal), nb = parseFloat(b.sortVal);
+        const aEmpty = a.sortVal === "", bEmpty = b.sortVal === "";
+        if (aEmpty && bEmpty) return 0;
+        if (aEmpty) return 1;
+        if (bEmpty) return -1;
+        if (!isNaN(na) && !isNaN(nb)) return ascending ? na - nb : nb - na;
+        return ascending ? a.sortVal.localeCompare(b.sortVal) : b.sortVal.localeCompare(a.sortVal);
+      });
+      const next: Record<string, string> = {};
+      for (let newR = 0; newR < rows.length; newR++) {
+        const oldR = rows[newR]!.row;
+        for (let c = 0; c < prev.colCount; c++) {
+          const val = prev.cells[cellId(c, oldR)];
+          if (val) next[cellId(c, newR)] = val;
+        }
+      }
+      return { ...prev, cells: next };
+    });
+    setContextMenu(null);
+  }, [pushUndo]);
+
+  // ── Find / Replace ─────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!findBar.open || !findBar.query) { setFindMatches([]); return; }
+    const q = findBar.query.toLowerCase();
+    const matches: string[] = [];
+    for (const [id, raw] of Object.entries(sheet.cells)) {
+      const display = displayValues[id] ?? raw;
+      if (raw.toLowerCase().includes(q) || display.toLowerCase().includes(q)) {
+        matches.push(id);
+      }
+    }
+    matches.sort((a, b) => {
+      const pa = parseCellRef(a)!, pb = parseCellRef(b)!;
+      return pa.row !== pb.row ? pa.row - pb.row : pa.col - pb.col;
+    });
+    setFindMatches(matches);
+    setFindIndex(0);
+    if (matches.length > 0) select(matches[0]!);
+  }, [findBar.open, findBar.query, sheet.cells, displayValues, select]);
+
+  const findNext = useCallback(() => {
+    if (findMatches.length === 0) return;
+    const next = (findIndex + 1) % findMatches.length;
+    setFindIndex(next);
+    select(findMatches[next]!);
+  }, [findMatches, findIndex, select]);
+
+  const findPrev = useCallback(() => {
+    if (findMatches.length === 0) return;
+    const prev = (findIndex - 1 + findMatches.length) % findMatches.length;
+    setFindIndex(prev);
+    select(findMatches[prev]!);
+  }, [findMatches, findIndex, select]);
+
+  const replaceOne = useCallback(() => {
+    if (findMatches.length === 0) return;
+    const id = findMatches[findIndex]!;
+    const raw = sheet.cells[id] ?? "";
+    const q = findBar.query;
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    writeCell(id, raw.replace(re, findBar.replace));
+  }, [findMatches, findIndex, findBar.query, findBar.replace, sheet.cells, writeCell]);
+
+  const replaceAll = useCallback(() => {
+    if (!findBar.query) return;
+    pushUndo();
+    const q = findBar.query;
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    setSheet((prev) => {
+      const next = { ...prev, cells: { ...prev.cells } };
+      for (const [id, raw] of Object.entries(next.cells)) {
+        if (re.test(raw)) next.cells[id] = raw.replace(re, findBar.replace);
+        re.lastIndex = 0;
+      }
+      return next;
+    });
+  }, [findBar.query, findBar.replace, pushUndo]);
+
+  const closeFindBar = useCallback(() => {
+    setFindBar({ open: false, query: "", replace: "", showReplace: false });
+    setFindMatches([]);
+    gridRef.current?.focus();
+  }, []);
 
   // ── Clear all ───────────────────────────────────────────────────────
 
@@ -979,6 +1149,8 @@ export function App() {
         ref={gridRef}
         tabIndex={0}
         onKeyDown={handleGridKeyDown}
+        onClick={() => setContextMenu(null)}
+        onContextMenu={(e) => e.preventDefault()}
         style={{ flex: 1, overflow: "auto", outline: "none", position: "relative" }}
       >
         <div
@@ -1063,6 +1235,8 @@ export function App() {
                   const inRange = selectionRange?.cells.has(id) ?? false;
                   const display = displayValues[id] ?? "";
                   const isNum = !isNaN(parseFloat(display)) && display !== "" && !isError(display);
+                  const isFindMatch = findMatches.includes(id);
+                  const isCurrentMatch = isFindMatch && findMatches[findIndex] === id;
                   const zebraColor = r % 2 === 1 ? "var(--color-zebra)" : undefined;
 
                   return (
@@ -1070,6 +1244,11 @@ export function App() {
                       key={id}
                       onMouseDown={(e) => handleCellMouseDown(id, e)}
                       onDoubleClick={() => { if (!editingCell) startEditing(id); }}
+                      onContextMenu={(e) => {
+                        e.preventDefault(); e.stopPropagation();
+                        select(id);
+                        setContextMenu({ x: e.clientX, y: e.clientY, cellId: id });
+                      }}
                       style={{
                         position: "relative",
                         borderBottom: "1px solid var(--color-line)",
@@ -1080,11 +1259,15 @@ export function App() {
                             ? "2px solid #5b8cd6"
                             : "none",
                         outlineOffset: "-1px",
-                        background: isPointed && !isSelected
-                          ? "rgba(91,140,214,0.12)"
-                          : inRange && !isSelected
-                            ? "rgba(192,133,82,0.10)"
-                            : zebraColor,
+                        background: isCurrentMatch
+                          ? "rgba(255,180,0,0.35)"
+                          : isFindMatch
+                            ? "rgba(255,220,80,0.2)"
+                            : isPointed && !isSelected
+                              ? "rgba(91,140,214,0.12)"
+                              : inRange && !isSelected
+                                ? "rgba(192,133,82,0.10)"
+                                : zebraColor,
                         zIndex: isSelected || isPointed ? 1 : 0,
                         cursor: "cell",
                       }}
@@ -1133,19 +1316,79 @@ export function App() {
         </div>
       </div>
 
+      {/* Find bar */}
+      {findBar.open && (
+        <div
+          style={{
+            display: "flex", alignItems: "center", gap: "0.375rem",
+            padding: "0.375rem 0.75rem",
+            borderTop: "1px solid var(--color-line)",
+            background: "var(--color-panel)", flexShrink: 0, flexWrap: "wrap",
+          }}
+        >
+          <input
+            ref={findInputRef}
+            value={findBar.query}
+            onChange={(e) => setFindBar((p) => ({ ...p, query: e.target.value }))}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") { e.preventDefault(); e.shiftKey ? findPrev() : findNext(); }
+              if (e.key === "Escape") closeFindBar();
+            }}
+            placeholder="Find..."
+            style={{
+              border: "1px solid var(--color-line)", borderRadius: "var(--radius-btn)",
+              padding: "0.25rem 0.5rem", fontSize: "0.8125rem", background: "var(--color-paper)",
+              color: "var(--color-ink)", outline: "none", width: "10rem",
+            }}
+          />
+          {findBar.showReplace && (
+            <input
+              value={findBar.replace}
+              onChange={(e) => setFindBar((p) => ({ ...p, replace: e.target.value }))}
+              onKeyDown={(e) => { if (e.key === "Escape") closeFindBar(); }}
+              placeholder="Replace..."
+              style={{
+                border: "1px solid var(--color-line)", borderRadius: "var(--radius-btn)",
+                padding: "0.25rem 0.5rem", fontSize: "0.8125rem", background: "var(--color-paper)",
+                color: "var(--color-ink)", outline: "none", width: "10rem",
+              }}
+            />
+          )}
+          <span style={{ fontSize: "0.6875rem", color: "var(--color-muted)" }}>
+            {findMatches.length > 0 ? `${findIndex + 1}/${findMatches.length}` : findBar.query ? "0 results" : ""}
+          </span>
+          {[
+            { label: "↑", action: findPrev },
+            { label: "↓", action: findNext },
+            ...(findBar.showReplace ? [
+              { label: "Replace", action: replaceOne },
+              { label: "All", action: replaceAll },
+            ] : []),
+            { label: "×", action: closeFindBar },
+          ].map(({ label, action }) => (
+            <button
+              key={label}
+              onClick={action}
+              style={{
+                border: "1px solid var(--color-line)", borderRadius: "var(--radius-btn)",
+                background: "transparent", color: "var(--color-muted)",
+                padding: "0.125rem 0.5rem", fontSize: "0.75rem", cursor: "pointer", fontWeight: 600,
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* Status bar */}
       <div
         style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "1.25rem",
+          display: "flex", alignItems: "center", gap: "1.25rem",
           padding: "0.25rem 0.75rem",
           borderTop: "1px solid var(--color-line)",
-          background: "var(--color-panel)",
-          flexShrink: 0,
-          minHeight: "1.5rem",
-          fontSize: "0.6875rem",
-          color: "var(--color-muted)",
+          background: "var(--color-panel)", flexShrink: 0,
+          minHeight: "1.5rem", fontSize: "0.6875rem", color: "var(--color-muted)",
         }}
       >
         {selectionStats.numCount > 1 && (
@@ -1160,6 +1403,55 @@ export function App() {
         <div style={{ flex: 1 }} />
         <span>{sheet.rowCount} rows × {sheet.colCount} cols</span>
       </div>
+
+      {/* Context menu */}
+      {contextMenu && (() => {
+        const p = parseCellRef(contextMenu.cellId);
+        if (!p) return null;
+        const items = [
+          { label: "Insert row above", action: () => { insertRow(p.row, "above"); setContextMenu(null); } },
+          { label: "Insert row below", action: () => { insertRow(p.row, "below"); setContextMenu(null); } },
+          { label: "Delete row", action: () => { deleteRow(p.row); setContextMenu(null); } },
+          { label: "─", action: () => {} },
+          { label: "Insert column left", action: () => { insertCol(p.col, "left"); setContextMenu(null); } },
+          { label: "Insert column right", action: () => { insertCol(p.col, "right"); setContextMenu(null); } },
+          { label: "Delete column", action: () => { deleteCol(p.col); setContextMenu(null); } },
+          { label: "─", action: () => {} },
+          { label: "Sort A → Z", action: () => sortByColumn(p.col, true) },
+          { label: "Sort Z → A", action: () => sortByColumn(p.col, false) },
+        ];
+        return (
+          <div
+            style={{
+              position: "fixed", left: contextMenu.x, top: contextMenu.y, zIndex: 100,
+              background: "var(--color-paper)", border: "1px solid var(--color-line)",
+              borderRadius: "var(--radius-btn)", boxShadow: "0 4px 16px rgba(0,0,0,0.12)",
+              padding: "0.25rem 0", minWidth: "10rem",
+            }}
+          >
+            {items.map((item, i) =>
+              item.label === "─" ? (
+                <div key={i} style={{ borderTop: "1px solid var(--color-line)", margin: "0.25rem 0" }} />
+              ) : (
+                <button
+                  key={item.label}
+                  onClick={item.action}
+                  style={{
+                    display: "block", width: "100%", textAlign: "left",
+                    background: "transparent", border: "none", cursor: "pointer",
+                    padding: "0.375rem 0.75rem", fontSize: "0.8125rem",
+                    color: "var(--color-ink)",
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "var(--color-panel)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                >
+                  {item.label}
+                </button>
+              )
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 }
