@@ -7,23 +7,48 @@ export function ContextMenu({ s }: { s: SpreadsheetState }) {
   const p = parseCellRef(s.contextMenu.cellId);
   if (!p) return null;
 
-  const items = [
-    { label: "Insert row above", action: () => { s.insertRow(p.row, "above"); s.setContextMenu(null); } },
-    { label: "Insert row below", action: () => { s.insertRow(p.row, "below"); s.setContextMenu(null); } },
-    { label: "Delete row", action: () => { s.deleteRow(p.row); s.setContextMenu(null); } },
+  const type = s.contextMenu.type ?? "cell";
+  const close = () => s.setContextMenu(null);
+
+  const colItems = [
+    { label: "Insert column left", action: () => { s.insertCol(p.col, "left"); close(); } },
+    { label: "Insert column right", action: () => { s.insertCol(p.col, "right"); close(); } },
+    { label: "Delete column", action: () => { s.deleteCol(p.col); close(); } },
     { label: "---", action: () => {} },
-    { label: "Insert column left", action: () => { s.insertCol(p.col, "left"); s.setContextMenu(null); } },
-    { label: "Insert column right", action: () => { s.insertCol(p.col, "right"); s.setContextMenu(null); } },
-    { label: "Delete column", action: () => { s.deleteCol(p.col); s.setContextMenu(null); } },
+    { label: "Sort A → Z", action: () => s.sortByColumn(p.col, true) },
+    { label: "Sort Z → A", action: () => s.sortByColumn(p.col, false) },
+  ];
+
+  const rowItems = [
+    { label: "Insert row above", action: () => { s.insertRow(p.row, "above"); close(); } },
+    { label: "Insert row below", action: () => { s.insertRow(p.row, "below"); close(); } },
+    { label: "Delete row", action: () => { s.deleteRow(p.row); close(); } },
+    { label: "---", action: () => {} },
+    {
+      label: s.frozenRows > 0 ? "Unfreeze first row" : "Freeze first row",
+      action: () => { s.toggleFreezeFirstRow(); close(); },
+    },
+  ];
+
+  const cellItems = [
+    { label: "Insert row above", action: () => { s.insertRow(p.row, "above"); close(); } },
+    { label: "Insert row below", action: () => { s.insertRow(p.row, "below"); close(); } },
+    { label: "Delete row", action: () => { s.deleteRow(p.row); close(); } },
+    { label: "---", action: () => {} },
+    { label: "Insert column left", action: () => { s.insertCol(p.col, "left"); close(); } },
+    { label: "Insert column right", action: () => { s.insertCol(p.col, "right"); close(); } },
+    { label: "Delete column", action: () => { s.deleteCol(p.col); close(); } },
     { label: "---2", action: () => {} },
     { label: "Sort A → Z", action: () => s.sortByColumn(p.col, true) },
     { label: "Sort Z → A", action: () => s.sortByColumn(p.col, false) },
     { label: "---3", action: () => {} },
     {
       label: s.frozenRows > 0 ? "Unfreeze first row" : "Freeze first row",
-      action: () => { s.toggleFreezeFirstRow(); s.setContextMenu(null); },
+      action: () => { s.toggleFreezeFirstRow(); close(); },
     },
   ];
+
+  const items = type === "col" ? colItems : type === "row" ? rowItems : cellItems;
 
   return (
     <div

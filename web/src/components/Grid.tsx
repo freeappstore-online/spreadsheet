@@ -108,6 +108,18 @@ export function Grid({ s }: { s: SpreadsheetState }) {
             return (
               <div
                 key={c}
+                onMouseDown={(e) => {
+                  if (e.button !== 0) return;
+                  s.select(cellId(c, 0));
+                  s.setSelectionEnd(cellId(c, s.sheet.rowCount - 1));
+                  s.gridRef.current?.focus();
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault(); e.stopPropagation();
+                  s.select(cellId(c, 0));
+                  s.setSelectionEnd(cellId(c, s.sheet.rowCount - 1));
+                  s.setContextMenu({ x: e.clientX, y: e.clientY, cellId: cellId(c, 0), type: "col" });
+                }}
                 style={{
                   width: w, flexShrink: 0, position: "relative",
                   display: "flex", alignItems: "center", justifyContent: "center",
@@ -117,6 +129,7 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                   fontSize: "0.6875rem", fontWeight: 600,
                   color: colSel ? "var(--color-ink)" : "var(--color-muted)",
                   userSelect: "none",
+                  cursor: "pointer",
                 }}
               >
                 {colLabel(c)}
@@ -141,16 +154,30 @@ export function Grid({ s }: { s: SpreadsheetState }) {
             : parseCellRef(s.selectedCell)?.row === r;
           return (
             <div key={r} style={{ position: "absolute", top: (r + 1) * s.ROW_HEIGHT, left: 0, height: s.ROW_HEIGHT, display: "flex", width: totalW }}>
-              <div style={{
-                position: "sticky", left: 0, zIndex: 1, width: s.HEADER_WIDTH, flexShrink: 0,
-                display: "flex", alignItems: "center", justifyContent: "center",
-                background: rowSel ? "var(--color-line)" : "var(--color-panel)",
-                borderBottom: "1px solid var(--color-line)",
-                borderRight: "1px solid var(--color-line)",
-                fontSize: "0.6875rem", fontWeight: 500,
-                color: rowSel ? "var(--color-ink)" : "var(--color-muted)",
-                userSelect: "none",
-              }}>
+              <div
+                onMouseDown={(e) => {
+                  if (e.button !== 0) return;
+                  s.select(cellId(0, r));
+                  s.setSelectionEnd(cellId(s.sheet.colCount - 1, r));
+                  s.gridRef.current?.focus();
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault(); e.stopPropagation();
+                  s.select(cellId(0, r));
+                  s.setSelectionEnd(cellId(s.sheet.colCount - 1, r));
+                  s.setContextMenu({ x: e.clientX, y: e.clientY, cellId: cellId(0, r), type: "row" });
+                }}
+                style={{
+                  position: "sticky", left: 0, zIndex: 1, width: s.HEADER_WIDTH, flexShrink: 0,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  background: rowSel ? "var(--color-line)" : "var(--color-panel)",
+                  borderBottom: "1px solid var(--color-line)",
+                  borderRight: "1px solid var(--color-line)",
+                  fontSize: "0.6875rem", fontWeight: 500,
+                  color: rowSel ? "var(--color-ink)" : "var(--color-muted)",
+                  userSelect: "none", cursor: "pointer",
+                }}
+              >
                 {r + 1}
               </div>
               {Array.from({ length: s.sheet.colCount }, (_, c) => {

@@ -27,7 +27,7 @@ export function useSpreadsheet() {
   const [pointMode, setPointMode] = useState<PointMode | null>(null);
   const [clipboard, setClipboard] = useState<{ type: "copy" | "cut"; ids: string[]; values: Record<string, string> } | null>(null);
   const [colWidths, setColWidths] = useState<Record<number, number>>({});
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; cellId: string } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; cellId: string; type?: "cell" | "col" | "row" } | null>(null);
   const [findBar, setFindBar] = useState<{ open: boolean; query: string; replace: string; showReplace: boolean }>({ open: false, query: "", replace: "", showReplace: false });
   const [showHelp, setShowHelp] = useState(false);
   const [colorPicker, setColorPicker] = useState<{ type: "bg" | "color"; x: number; y: number } | null>(null);
@@ -91,13 +91,20 @@ export function useSpreadsheet() {
 
   // ── Derived state ───────────────────────────────────────────────────
 
+  // Lookup function for cross-sheet refs (Sheet2!A1).
+  // Sheet names are matched case-insensitively (Excel convention).
+  const sheetLookup = useCallback((sheetName: string, ref: string): string => {
+    const found = workbook.sheets.find((s) => s.name.toLowerCase() === sheetName.toLowerCase());
+    return found?.cells[ref] ?? "";
+  }, [workbook.sheets]);
+
   const displayValues = useMemo(() => {
     const result: Record<string, string> = {};
     for (const id of Object.keys(sheet.cells)) {
-      result[id] = computeDisplay(id, sheet.cells);
+      result[id] = computeDisplay(id, sheet.cells, sheetLookup);
     }
     return result;
-  }, [sheet.cells]);
+  }, [sheet.cells, sheetLookup]);
 
   const selectionRange = useMemo<{ minC: number; maxC: number; minR: number; maxR: number; cells: Set<string> } | null>(() => {
     if (!selectionEnd) return null;
@@ -566,7 +573,7 @@ export function useSpreadsheet() {
       for (let r = 0; r < prev.rowCount; r++) {
         const id = cellId(col, r);
         const raw = prev.cells[id] ?? "";
-        const display = raw.startsWith("=") ? computeDisplay(id, prev.cells) : raw;
+        const display = raw.startsWith("=") ? computeDisplay(id, prev.cells, sheetLookup) : raw;
         rows.push({ row: r, sortVal: display });
       }
       rows.sort((a, b) => {
@@ -594,7 +601,7 @@ export function useSpreadsheet() {
       return { ...prev, cells: nextCells, formats: nextFormats };
     });
     setContextMenu(null);
-  }, [pushUndo, setSheet]);
+  }, [pushUndo, setSheet, sheetLookup]);
 
   // ── Find / Replace ─────────────────────────────────────────────────
 
@@ -943,7 +950,7 @@ export function useSpreadsheet() {
       const cols: string[] = [];
       for (let c = 0; c <= maxCol; c++) {
         const raw = sheet.cells[cellId(c, r)] ?? "";
-        const val = raw.startsWith("=") ? computeDisplay(cellId(c, r), sheet.cells) : raw;
+        const val = raw.startsWith("=") ? computeDisplay(cellId(c, r), sheet.cells, sheetLookup) : raw;
         cols.push(val.includes(",") || val.includes('"') || val.includes("\n")
           ? `"${val.replace(/"/g, '""')}"` : val);
       }
@@ -955,7 +962,7 @@ export function useSpreadsheet() {
     a.download = "spreadsheet.csv";
     a.click();
     URL.revokeObjectURL(a.href);
-  }, [sheet.cells]);
+  }, [sheet.cells, sheetLookup]);
 
   const importCsv = useCallback(() => {
     const input = document.createElement("input");
@@ -1098,6 +1105,7 @@ export function useSpreadsheet() {
     frozenRows,
     autoFillTarget,
     setAutoFillTarget,
+    setSelectionEnd,
     toggleFreezeFirstRow,
     performAutoFill,
 

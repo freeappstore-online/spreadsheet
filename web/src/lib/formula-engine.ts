@@ -1,20 +1,55 @@
 import { expandRange } from "./cell-refs";
 
+// Optional callback to look up cells from other sheets (for Sheet!A1 references).
+// Returns the raw cell value (which may itself be a formula).
+export type SheetLookup = (sheetName: string, cellRef: string) => string;
+
+// Match qualified ref: SheetName!A1 (sheet name is alphanumeric + underscore, must start with letter)
+const QUALIFIED_REF_RE = /\b([A-Za-z_][\w]*)!([A-Z]+\d+)\b/g;
+
+// String literal (double quotes; escape with "")
+function isStringLiteral(s: string): boolean {
+  const t = s.trim();
+  return t.length >= 2 && t.startsWith('"') && t.endsWith('"');
+}
+
+function stripQuotes(s: string): string {
+  const t = s.trim();
+  if (!isStringLiteral(t)) return t;
+  return t.slice(1, -1).replace(/""/g, '"');
+}
+
 export function evaluateFormula(
   formula: string,
   cells: Record<string, string>,
   visited: Set<string>,
   currentCell: string,
+  sheetLookup?: SheetLookup,
 ): string {
   if (visited.has(currentCell)) return "#CIRC!";
   visited.add(currentCell);
   const expr = formula.slice(1).trim();
 
   const resolveRef = (ref: string): number => {
+    // Cross-sheet ref?
+    if (ref.includes("!") && sheetLookup) {
+      const [sheetName, cellRef] = ref.split("!");
+      if (!sheetName || !cellRef) return 0;
+      const raw = sheetLookup(sheetName, cellRef);
+      if (!raw) return 0;
+      // Note: cross-sheet circular detection uses qualified name as the visited key
+      const qualifiedKey = `${sheetName}!${cellRef}`;
+      if (visited.has(qualifiedKey)) return 0;
+      const val = raw.startsWith("=")
+        ? evaluateFormula(raw, cells, new Set([...visited, qualifiedKey]), qualifiedKey, sheetLookup)
+        : raw;
+      const num = parseFloat(val);
+      return isNaN(num) ? 0 : num;
+    }
     const raw = cells[ref] ?? "";
     if (!raw) return 0;
     const val = raw.startsWith("=")
-      ? evaluateFormula(raw, cells, new Set(visited), ref)
+      ? evaluateFormula(raw, cells, new Set(visited), ref, sheetLookup)
       : raw;
     const num = parseFloat(val);
     return isNaN(num) ? 0 : num;
@@ -22,6 +57,7 @@ export function evaluateFormula(
 
   const resolveRefs = (arg: string): number[] => {
     arg = arg.trim();
+    if (isStringLiteral(arg)) return [parseFloat(stripQuotes(arg)) || 0];
     if (arg.includes(":")) return expandRange(arg).map(resolveRef);
     return [resolveRef(arg)];
   };
@@ -31,7 +67,11 @@ export function evaluateFormula(
     const fn = fnStart[1]!.toUpperCase();
     const inner = expr.slice(fnStart[0].length, -1);
     const args = splitArgs(inner);
-    const evalArg = (a: string) => evaluateExpression(a.trim(), cells, visited, currentCell);
+    const evalArg = (a: string) => {
+      const trimmed = a.trim();
+      if (isStringLiteral(trimmed)) return stripQuotes(trimmed);
+      return evaluateExpression(trimmed, cells, visited, currentCell, sheetLookup);
+    };
     const numArg = (a: string) => { const v = parseFloat(evalArg(a)); return isNaN(v) ? 0 : v; };
 
     switch (fn) {
@@ -45,6 +85,7 @@ export function evaluateFormula(
       case "COUNT": return String(args.flatMap(resolveRefs).filter((n) => n !== 0).length);
       case "COUNTA": return String(args.flatMap((a) => {
         a = a.trim();
+        if (isStringLiteral(a)) return [stripQuotes(a)];
         if (a.includes(":")) return expandRange(a).map((r) => cells[r] ?? "");
         return [cells[a] ?? ""];
       }).filter((v) => v !== "").length);
@@ -80,6 +121,7 @@ export function evaluateFormula(
         const text = evalArg(args[0] ?? "");
         const old = evalArg(args[1] ?? "");
         const repl = evalArg(args[2] ?? "");
+        if (!old) return text;
         return text.split(old).join(repl);
       }
       case "TEXT": return evalArg(args[0] ?? "");
@@ -97,14 +139,27 @@ export function evaluateFormula(
   for (const ch of expr) { if (ch === "(") depth++; if (ch === ")") depth--; }
   if (depth !== 0) return "#PAREN!";
 
-  return evaluateExpression(expr, cells, visited, currentCell);
+  return evaluateExpression(expr, cells, visited, currentCell, sheetLookup);
 }
 
+// Split function args on commas at depth 0, respecting parens AND string literals.
 export function splitArgs(str: string): string[] {
   const args: string[] = [];
   let depth = 0;
   let current = "";
-  for (const ch of str) {
+  let inString = false;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i]!;
+    if (inString) {
+      current += ch;
+      if (ch === '"') {
+        // Escape: "" inside string literal
+        if (str[i + 1] === '"') { current += '"'; i++; }
+        else inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') { inString = true; current += ch; continue; }
     if (ch === "(") depth++;
     else if (ch === ")") depth--;
     if (ch === "," && depth === 0) { args.push(current); current = ""; }
@@ -119,15 +174,35 @@ export function evaluateExpression(
   cells: Record<string, string>,
   visited: Set<string>,
   _currentCell: string,
+  sheetLookup?: SheetLookup,
 ): string {
   let resolved = expr.trim();
+
+  // If the entire expression is a string literal, return its content
+  if (isStringLiteral(resolved)) return stripQuotes(resolved);
+
+  // Replace cross-sheet refs FIRST (before bare cell ref replacement)
+  resolved = resolved.replace(QUALIFIED_REF_RE, (_, sheetName: string, ref: string) => {
+    if (!sheetLookup) return "0";
+    const qualifiedKey = `${sheetName}!${ref}`;
+    if (visited.has(qualifiedKey)) return "0";
+    const raw = sheetLookup(sheetName, ref);
+    if (!raw) return "0";
+    if (raw.startsWith("=")) {
+      return evaluateFormula(raw, cells, new Set([...visited, qualifiedKey]), qualifiedKey, sheetLookup);
+    }
+    return raw;
+  });
+
+  // Replace bare cell refs
   resolved = resolved.replace(/\b([A-Z]+\d+)\b/gi, (match) => {
     const ref = match.toUpperCase();
     const raw = cells[ref] ?? "";
     if (!raw) return "0";
-    if (raw.startsWith("=")) return evaluateFormula(raw, cells, new Set(visited), ref);
+    if (raw.startsWith("=")) return evaluateFormula(raw, cells, new Set(visited), ref, sheetLookup);
     return raw;
   });
+
   try {
     if (/^[\d\s+\-*/().%<>=!&|]+$/.test(resolved)) {
       resolved = resolved.replace(/(?<!=)=(?!=)/g, "==");
@@ -143,9 +218,13 @@ export function evaluateExpression(
   } catch { return "#ERROR!"; }
 }
 
-export function computeDisplay(id: string, cells: Record<string, string>): string {
+export function computeDisplay(
+  id: string,
+  cells: Record<string, string>,
+  sheetLookup?: SheetLookup,
+): string {
   const raw = cells[id];
   if (!raw) return "";
   if (!raw.startsWith("=")) return raw;
-  return evaluateFormula(raw, cells, new Set(), id);
+  return evaluateFormula(raw, cells, new Set(), id, sheetLookup);
 }

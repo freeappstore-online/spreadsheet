@@ -56,9 +56,26 @@ describe("string functions", () => {
   it("MID", () => expect(eval_("=MID(B1,2,3)")).toBe("ell"));
   it("CONCATENATE", () => expect(eval_("=CONCATENATE(B1,A1)")).toBe("hello10"));
   it("CONCAT alias", () => expect(eval_("=CONCAT(B1,A1)")).toBe("hello10"));
-  it("SUBSTITUTE", () => {
+  it("SUBSTITUTE with cell refs", () => {
     const c = { A1: "hello world" };
     expect(eval_('=SUBSTITUTE(A1,world,earth)', c)).toBe("hello earth");
+  });
+  it('SUBSTITUTE with string literals', () => {
+    const c = { A1: "hello world" };
+    expect(eval_('=SUBSTITUTE(A1,"world","earth")', c)).toBe("hello earth");
+  });
+  it("UPPER with string literal", () => {
+    expect(eval_('=UPPER("hello")', {})).toBe("HELLO");
+  });
+  it("CONCAT mixing literals and refs", () => {
+    const c = { A1: "world" };
+    expect(eval_('=CONCAT("hello ",A1)', c)).toBe("hello world");
+  });
+  it("LEN with literal containing comma", () => {
+    expect(eval_('=LEN("a,b,c")', {})).toBe("5");
+  });
+  it("escaped quote in literal", () => {
+    expect(eval_('=LEN("a""b")', {})).toBe("3");
   });
   it("VALUE", () => expect(eval_("=VALUE(A1)")).toBe("10"));
   it("VALUE non-number", () => expect(eval_("=VALUE(B1)")).toBe("#VALUE!"));
@@ -109,6 +126,31 @@ describe("expandRange", () => {
   it("2D range", () => expect(expandRange("A1:B2")).toEqual(["A1", "B1", "A2", "B2"]));
   it("reversed range", () => expect(expandRange("B2:A1")).toEqual(["A1", "B1", "A2", "B2"]));
   it("invalid range", () => expect(expandRange("A1")).toEqual([]));
+});
+
+describe("cross-sheet references", () => {
+  const sheet1: Record<string, string> = { A1: "10" };
+  const sheet2: Record<string, string> = { B5: "42", B6: "8" };
+  const lookup = (name: string, ref: string) => {
+    if (name.toLowerCase() === "sheet2") return sheet2[ref] ?? "";
+    if (name.toLowerCase() === "sheet1") return sheet1[ref] ?? "";
+    return "";
+  };
+  it("reads single cell from other sheet", () => {
+    expect(evaluateFormula("=Sheet2!B5", sheet1, new Set(), "Z1", lookup)).toBe("42");
+  });
+  it("arithmetic across sheets", () => {
+    expect(evaluateFormula("=Sheet2!B5+A1", sheet1, new Set(), "Z1", lookup)).toBe("52");
+  });
+  it("SUM with cross-sheet refs", () => {
+    expect(evaluateFormula("=SUM(Sheet2!B5, Sheet2!B6)", sheet1, new Set(), "Z1", lookup)).toBe("50");
+  });
+  it("unknown sheet returns 0", () => {
+    expect(evaluateFormula("=Nothere!A1", sheet1, new Set(), "Z1", lookup)).toBe("0");
+  });
+  it("case-insensitive sheet name", () => {
+    expect(evaluateFormula("=SHEET2!B5", sheet1, new Set(), "Z1", lookup)).toBe("42");
+  });
 });
 
 describe("computeDisplay", () => {
