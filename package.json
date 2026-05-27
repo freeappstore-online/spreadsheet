@@ -1,0 +1,22 @@
+{
+  "name": "freespreadsheetapp",
+  "private": true,
+  "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": ">=22"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "scripts": {
+    "dev": "pnpm --filter @freespreadsheetapp/web dev",
+    "build": "pnpm --filter @freespreadsheetapp/web build",
+    "test": "pnpm --filter @freespreadsheetapp/web exec tsc -b"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freeappstore-online/spreadsheet.git"
+  }
+}

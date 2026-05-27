@@ -1,0 +1,76 @@
+name: Deploy to R2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # If your app uses VITE_* public config (OAuth client IDs, Firebase
+      # config, etc.), add them as GitHub repo Variables and pass them here.
+      # See https://freeappstore.online/skills.md "App Config & Secrets".
+      # Example:
+      #   env:
+      #     VITE_GOOGLE_CLIENT_ID: ${{ vars.VITE_GOOGLE_CLIENT_ID }}
+      - name: Build
+        run: pnpm build
+
+      - name: Verify build output
+        run: |
+          test -d ./web/dist || { echo "::error::No build output at web/dist"; exit 1; }
+          test -n "$(ls -A ./web/dist)" || { echo "::error::web/dist is empty"; exit 1; }
+
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          aws s3 sync ./web/dist "s3://fas-apps/apps/${GITHUB_REPOSITORY##*/}/" \
+            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" \
+            --delete \
+            --no-progress
+          echo "Deployed apps/${GITHUB_REPOSITORY##*/} from ${GITHUB_SHA::7}"
+
+      - name: Code health scan
+        run: npx @vibecodeqa/cli@0.31 --json --badge > /dev/null 2>&1 || true
+      - name: Upload code health
+        if: always()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          APP_ID="${GITHUB_REPOSITORY##*/}"
+          EP="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
+          if [ -f .vibe-check/report.json ]; then
+            aws s3 cp .vibe-check/report.json "s3://fas-apps/apps/$APP_ID/.vcqa/report.json" \
+              --endpoint-url "$EP" --content-type application/json --no-progress
+          fi
+          if [ -f .vibe-check/badge.svg ]; then
+            aws s3 cp .vibe-check/badge.svg "s3://fas-apps/apps/$APP_ID/.vcqa/badge.svg" \
+              --endpoint-url "$EP" --content-type image/svg+xml --no-progress
+          fi
