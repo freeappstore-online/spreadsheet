@@ -96,8 +96,44 @@ export function FormattingToolbar({ s }: { s: SpreadsheetState }) {
         </button>
       </div>
       <span style={{ width: 1, height: "1rem", background: "var(--color-line)", margin: "0 0.25rem" }} />
+      {/* Number format dropdown */}
+      <select
+        title="Number format"
+        value={s.sheet.formats[s.selectedCell]?.numFmt ?? ""}
+        onChange={(e) => {
+          const v = e.target.value;
+          s.applyFormat({ numFmt: (v === "" ? undefined : v as "currency" | "percent" | "decimal2") });
+        }}
+        style={{
+          height: "1.75rem", border: "1px solid var(--color-line)", borderRadius: "0.25rem",
+          background: "var(--color-paper)", color: "var(--color-muted)",
+          fontSize: "0.75rem", padding: "0 0.375rem", cursor: "pointer",
+        }}
+      >
+        <option value="">Auto</option>
+        <option value="currency">$ Currency</option>
+        <option value="percent">% Percent</option>
+        <option value="decimal2">0.00 Decimal</option>
+      </select>
+      <span style={{ width: 1, height: "1rem", background: "var(--color-line)", margin: "0 0.25rem" }} />
       <button
-        title="Keyboard shortcuts (?)"
+        title="Conditional formatting"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => s.setCondFormatDialog(true)}
+        style={{
+          height: "1.75rem", padding: "0 0.5rem",
+          border: "1px solid var(--color-line)", borderRadius: "0.25rem",
+          background: (s.sheet.conditionalRules?.length ?? 0) > 0 ? "rgba(192,133,82,0.12)" : "transparent",
+          color: (s.sheet.conditionalRules?.length ?? 0) > 0 ? "var(--color-accent)" : "var(--color-muted)",
+          cursor: "pointer", fontSize: "0.75rem", fontWeight: 600,
+          display: "flex", alignItems: "center",
+        }}
+      >
+        ▦ Rules{(s.sheet.conditionalRules?.length ?? 0) > 0 ? ` (${s.sheet.conditionalRules!.length})` : ""}
+      </button>
+      <span style={{ width: 1, height: "1rem", background: "var(--color-line)", margin: "0 0.25rem" }} />
+      <button
+        title="Keyboard shortcuts (Ctrl+/)"
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => s.setShowHelp((p) => !p)}
         style={{

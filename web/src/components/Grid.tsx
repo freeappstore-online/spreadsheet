@@ -188,6 +188,7 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                 const inRange = s.selectionRange?.cells.has(id) ?? false;
                 const display = s.displayValues[id] ?? "";
                 const fmt = s.sheet.formats[id];
+                const cond = s.evalConditional(id, display);
                 const isNum = !isNaN(parseFloat(display)) && display !== "" && !isError(display);
                 const isFindMatch = findSet.has(id);
                 const isCurrentMatch = id === currentMatch;
@@ -217,7 +218,7 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                         : isFillPreview ? "rgba(192,133,82,0.20)"
                         : isPointed && !isSelected ? "rgba(91,140,214,0.12)"
                         : inRange && !isSelected ? "rgba(192,133,82,0.10)"
-                        : fmt?.bg ?? zebraColor,
+                        : cond?.bg ?? fmt?.bg ?? zebraColor,
                       zIndex: isSelected || isPointed || isAnchor ? 2 : 0,
                       cursor: "cell",
                     }}
@@ -238,12 +239,12 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                       <div style={{
                         padding: "0 4px", fontSize: "0.8125rem", lineHeight: `${s.ROW_HEIGHT}px`,
                         overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                        color: isError(display) ? "#d94040" : fmt?.color ?? "var(--color-ink)",
+                        color: isError(display) ? "#d94040" : cond?.color ?? fmt?.color ?? "var(--color-ink)",
                         textAlign: fmt?.align ?? (isNum ? "right" : "left"),
-                        fontWeight: fmt?.bold ? 700 : isError(display) ? 600 : 400,
+                        fontWeight: cond?.bold || fmt?.bold ? 700 : isError(display) ? 600 : 400,
                         fontStyle: fmt?.italic ? "italic" : undefined,
                       }}>
-                        {s.formatDisplay(display)}
+                        {s.formatDisplay(display, fmt?.numFmt)}
                       </div>
                     )}
                     {isAnchor && !isEditing && (
@@ -291,6 +292,7 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                 const inRange = s.selectionRange?.cells.has(id) ?? false;
                 const display = s.displayValues[id] ?? "";
                 const fmt = s.sheet.formats[id];
+                const cond = s.evalConditional(id, display);
                 const isNum = !isNaN(parseFloat(display)) && display !== "" && !isError(display);
                 const w = s.getColWidth(c);
 
@@ -312,19 +314,19 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                       outlineOffset: "-1px",
                       background: isPointed && !isSelected ? "rgba(91,140,214,0.12)"
                         : inRange && !isSelected ? "rgba(192,133,82,0.10)"
-                        : fmt?.bg ?? "var(--color-paper)",
+                        : cond?.bg ?? fmt?.bg ?? "var(--color-paper)",
                       cursor: "cell",
                     }}
                   >
                     <div style={{
                       padding: "0 4px", fontSize: "0.8125rem", lineHeight: `${s.ROW_HEIGHT}px`,
                       overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                      color: isError(display) ? "#d94040" : fmt?.color ?? "var(--color-ink)",
+                      color: isError(display) ? "#d94040" : cond?.color ?? fmt?.color ?? "var(--color-ink)",
                       textAlign: fmt?.align ?? (isNum ? "right" : "left"),
-                      fontWeight: fmt?.bold ? 700 : isError(display) ? 600 : 400,
+                      fontWeight: cond?.bold || fmt?.bold ? 700 : isError(display) ? 600 : 400,
                       fontStyle: fmt?.italic ? "italic" : undefined,
                     }}>
-                      {s.formatDisplay(display)}
+                      {s.formatDisplay(display, fmt?.numFmt)}
                     </div>
                   </div>
                 );

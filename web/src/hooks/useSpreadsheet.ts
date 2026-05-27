@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } from "react";
-import type { CellFormat, Sheet, WorkbookData, PointMode } from "../types";
+import type { CellFormat, ConditionalRule, Sheet, WorkbookData, PointMode } from "../types";
 import { DEFAULT_COLS, DEFAULT_ROWS, MAX_UNDO, COL_WIDTH, ROW_HEIGHT, HEADER_WIDTH } from "../constants";
-import { cellId, parseCellRef, clamp } from "../lib/cell-refs";
+import { cellId, parseCellRef, clamp, expandRange } from "../lib/cell-refs";
 import { computeDisplay } from "../lib/formula-engine";
 import { parseCsvLine } from "../lib/csv";
 import { isRefPosition, buildRefString, splice } from "../lib/point-mode";
@@ -35,6 +35,7 @@ export function useSpreadsheet() {
   const [findIndex, setFindIndex] = useState(0);
   const [frozenRows, setFrozenRows] = useState(0);
   const [autoFillTarget, setAutoFillTarget] = useState<string | null>(null);
+  const [condFormatDialog, setCondFormatDialog] = useState(false);
 
   const editInputRef = useRef<HTMLInputElement>(null);
   const formulaBarRef = useRef<HTMLInputElement>(null);
@@ -711,6 +712,59 @@ export function useSpreadsheet() {
     setFrozenRows((n) => (n > 0 ? 0 : 1));
   }, []);
 
+  // ── Conditional formatting ──────────────────────────────────────────
+
+  const addConditionalRule = useCallback((rule: ConditionalRule) => {
+    pushUndo();
+    setSheet((prev) => ({
+      ...prev,
+      conditionalRules: [...(prev.conditionalRules ?? []), rule],
+    }));
+  }, [pushUndo, setSheet]);
+
+  const removeConditionalRule = useCallback((index: number) => {
+    pushUndo();
+    setSheet((prev) => ({
+      ...prev,
+      conditionalRules: (prev.conditionalRules ?? []).filter((_, i) => i !== index),
+    }));
+  }, [pushUndo, setSheet]);
+
+  // Compute effective conditional format for a cell. Last matching rule wins.
+  const evalConditional = useCallback((cellRef: string, displayVal: string): { bg?: string; color?: string; bold?: boolean } | null => {
+    const rules = sheet.conditionalRules ?? [];
+    if (rules.length === 0) return null;
+    const cellPos = parseCellRef(cellRef);
+    if (!cellPos) return null;
+
+    let result: { bg?: string; color?: string; bold?: boolean } | null = null;
+    for (const rule of rules) {
+      // Check if cell is in range
+      const range = expandRange(rule.range);
+      const inRange = range.length > 0 ? range.includes(cellRef) : rule.range === cellRef;
+      if (!inRange) continue;
+
+      const num = parseFloat(displayVal);
+      const ruleNum = parseFloat(rule.value);
+      let matches = false;
+
+      switch (rule.type) {
+        case "greater": matches = !isNaN(num) && !isNaN(ruleNum) && num > ruleNum; break;
+        case "less": matches = !isNaN(num) && !isNaN(ruleNum) && num < ruleNum; break;
+        case "equal": matches = displayVal === rule.value; break;
+        case "contains": matches = displayVal.toLowerCase().includes(rule.value.toLowerCase()); break;
+        case "between": {
+          const [lo, hi] = rule.value.split("..").map((v) => parseFloat(v));
+          matches = !isNaN(num) && lo !== undefined && hi !== undefined && !isNaN(lo) && !isNaN(hi) && num >= lo && num <= hi;
+          break;
+        }
+      }
+
+      if (matches) result = rule.format;
+    }
+    return result;
+  }, [sheet.conditionalRules]);
+
   // ── Auto-fill ───────────────────────────────────────────────────────
   // Detect a series from source cells and extend it to target cells.
 
@@ -1006,10 +1060,23 @@ export function useSpreadsheet() {
 
   // ── Number formatting ────────────────────────────────────────────────
 
-  const formatDisplay = useCallback((val: string): string => {
+  const formatDisplay = useCallback((val: string, numFmt?: CellFormat["numFmt"]): string => {
     if (!val || val.startsWith("#")) return val;
     const num = parseFloat(val);
-    if (isNaN(num) || val !== String(num)) return val;
+    if (isNaN(num)) return val;
+
+    if (numFmt === "currency") {
+      return num.toLocaleString("en-US", { style: "currency", currency: "USD" });
+    }
+    if (numFmt === "percent") {
+      return (num * 100).toLocaleString("en-US", { maximumFractionDigits: 2 }) + "%";
+    }
+    if (numFmt === "decimal2") {
+      return num.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    // Auto formatting (only if val is exactly a number string)
+    if (val !== String(num)) return val;
     if (Number.isInteger(num) && Math.abs(num) >= 1000) {
       return num.toLocaleString("en-US");
     }
@@ -1108,6 +1175,11 @@ export function useSpreadsheet() {
     setSelectionEnd,
     toggleFreezeFirstRow,
     performAutoFill,
+    condFormatDialog,
+    setCondFormatDialog,
+    addConditionalRule,
+    removeConditionalRule,
+    evalConditional,
 
     // Derived
     displayValues,

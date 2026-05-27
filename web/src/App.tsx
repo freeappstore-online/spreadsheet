@@ -9,6 +9,7 @@ import { SheetTabs } from "./components/SheetTabs";
 import { StatusBar } from "./components/StatusBar";
 import { ContextMenu } from "./components/ContextMenu";
 import { HelpDialog } from "./components/HelpDialog";
+import { ConditionalFormatDialog } from "./components/ConditionalFormatDialog";
 
 export function App() {
   const s = useSpreadsheet();
@@ -24,6 +25,7 @@ export function App() {
       <StatusBar s={s} />
       {s.contextMenu && <ContextMenu s={s} />}
       {s.showHelp && <HelpDialog s={s} />}
+      {s.condFormatDialog && <ConditionalFormatDialog s={s} />}
     </div>
   );
 }
