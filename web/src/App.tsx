@@ -2,10 +2,25 @@ import { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } fr
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-interface SheetData {
+interface CellFormat {
+  bold?: boolean;
+  italic?: boolean;
+  align?: "left" | "center" | "right";
+  bg?: string;
+  color?: string;
+}
+
+interface Sheet {
+  name: string;
   cells: Record<string, string>;
+  formats: Record<string, CellFormat>;
   colCount: number;
   rowCount: number;
+}
+
+interface WorkbookData {
+  sheets: Sheet[];
+  activeSheet: number;
 }
 
 interface PointMode {
@@ -22,22 +37,33 @@ const DEFAULT_COLS = 26;
 const DEFAULT_ROWS = 50;
 const MAX_UNDO = 50;
 
-function loadSheet(): SheetData {
+function makeSheet(name: string): Sheet {
+  return { name, cells: {}, formats: {}, colCount: DEFAULT_COLS, rowCount: DEFAULT_ROWS };
+}
+
+function loadWorkbook(): WorkbookData {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      const parsed = JSON.parse(raw) as Partial<SheetData>;
+      const parsed = JSON.parse(raw);
+      if (parsed.sheets) return parsed as WorkbookData;
+      // Migrate from old single-sheet format
       return {
-        cells: parsed.cells ?? {},
-        colCount: parsed.colCount ?? DEFAULT_COLS,
-        rowCount: parsed.rowCount ?? DEFAULT_ROWS,
+        sheets: [{
+          name: "Sheet 1",
+          cells: parsed.cells ?? {},
+          formats: {},
+          colCount: parsed.colCount ?? DEFAULT_COLS,
+          rowCount: parsed.rowCount ?? DEFAULT_ROWS,
+        }],
+        activeSheet: 0,
       };
     }
   } catch { /* ignore */ }
-  return { cells: {}, colCount: DEFAULT_COLS, rowCount: DEFAULT_ROWS };
+  return { sheets: [makeSheet("Sheet 1")], activeSheet: 0 };
 }
 
-function saveSheet(data: SheetData) {
+function saveWorkbook(data: WorkbookData) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
 }
 
@@ -291,7 +317,15 @@ function splice(str: string, start: number, end: number, insert: string): string
 // ── App ────────────────────────────────────────────────────────────────
 
 export function App() {
-  const [sheet, setSheet] = useState<SheetData>(loadSheet);
+  const [workbook, setWorkbook] = useState<WorkbookData>(loadWorkbook);
+  const sheet = workbook.sheets[workbook.activeSheet]!;
+  const setSheet = useCallback((updater: Sheet | ((prev: Sheet) => Sheet)) => {
+    setWorkbook((wb) => {
+      const sheets = [...wb.sheets];
+      sheets[wb.activeSheet] = typeof updater === "function" ? updater(sheets[wb.activeSheet]!) : updater;
+      return { ...wb, sheets };
+    });
+  }, []);
   const [selectedCell, setSelectedCell] = useState<string>("A1");
   const [selectionEnd, setSelectionEnd] = useState<string | null>(null);
   const [editingCell, setEditingCell] = useState<string | null>(null);
@@ -303,6 +337,8 @@ export function App() {
   const [colWidths, setColWidths] = useState<Record<number, number>>({});
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; cellId: string } | null>(null);
   const [findBar, setFindBar] = useState<{ open: boolean; query: string; replace: string; showReplace: boolean }>({ open: false, query: "", replace: "", showReplace: false });
+  const [showHelp, setShowHelp] = useState(false);
+  const [colorPicker, setColorPicker] = useState<{ type: "bg" | "color"; x: number; y: number } | null>(null);
   const [findMatches, setFindMatches] = useState<string[]>([]);
   const [findIndex, setFindIndex] = useState(0);
 
@@ -317,7 +353,7 @@ export function App() {
 
   // ── Persistence ─────────────────────────────────────────────────────
 
-  useEffect(() => { saveSheet(sheet); }, [sheet]);
+  useEffect(() => { saveWorkbook(workbook); }, [workbook]);
 
   // ── Focus & cursor: run synchronously before paint ──────────────────
 
@@ -602,6 +638,21 @@ export function App() {
     if (meta && (e.key === "y" || (e.key === "z" && e.shiftKey))) { e.preventDefault(); redo(); return; }
     if (meta && e.key === "f") { e.preventDefault(); setFindBar((p) => ({ ...p, open: true })); requestAnimationFrame(() => findInputRef.current?.focus()); return; }
     if (meta && e.key === "h") { e.preventDefault(); setFindBar((p) => ({ ...p, open: true, showReplace: true })); requestAnimationFrame(() => findInputRef.current?.focus()); return; }
+    if (meta && e.key === "b") {
+      e.preventDefault();
+      const cur = sheet.formats[selectedCell]?.bold;
+      const ids = selectionRange ? [...selectionRange.cells] : [selectedCell];
+      setSheet((prev) => { const f = { ...prev.formats }; for (const id of ids) { f[id] = { ...f[id], bold: !cur }; } return { ...prev, formats: f }; });
+      return;
+    }
+    if (meta && e.key === "i") {
+      e.preventDefault();
+      const cur = sheet.formats[selectedCell]?.italic;
+      const ids = selectionRange ? [...selectionRange.cells] : [selectedCell];
+      setSheet((prev) => { const f = { ...prev.formats }; for (const id of ids) { f[id] = { ...f[id], italic: !cur }; } return { ...prev, formats: f }; });
+      return;
+    }
+    if (e.key === "?" || (meta && e.key === "/")) { e.preventDefault(); setShowHelp((p) => !p); return; }
 
     if (meta && e.key === "c") {
       e.preventDefault();
@@ -680,7 +731,7 @@ export function App() {
           startEditing(selectedCell, e.key);
         }
     }
-  }, [selectedCell, selectionRange, sheet.cells, sheet.colCount, sheet.rowCount, clipboard, move, extendSelection, startEditing, writeCell, pushUndo, undo, redo]);
+  }, [selectedCell, selectionRange, sheet, clipboard, move, extendSelection, startEditing, writeCell, pushUndo, undo, redo, setSheet]);
 
   // ── Keyboard: inline cell input ─────────────────────────────────────
 
@@ -918,11 +969,81 @@ export function App() {
   const clearAll = useCallback(() => {
     if (editingCell) cancelEdit();
     pushUndo();
-    setSheet({ cells: {}, colCount: DEFAULT_COLS, rowCount: DEFAULT_ROWS });
+    setSheet((s) => ({ ...s, cells: {}, formats: {} }));
     setSelectedCell("A1");
     setFormulaBarValue("");
     gridRef.current?.focus();
-  }, [editingCell, cancelEdit, pushUndo]);
+  }, [editingCell, cancelEdit, pushUndo, setSheet]);
+
+  // ── Cell formatting ─────────────────────────────────────────────────
+
+  const applyFormat = useCallback((update: Partial<CellFormat>) => {
+    const ids = selectionRange ? [...selectionRange.cells] : [selectedCell];
+    setSheet((prev) => {
+      const formats = { ...prev.formats };
+      for (const id of ids) {
+        const existing = formats[id] ?? {};
+        const merged = { ...existing, ...update };
+        const isEmpty = !merged.bold && !merged.italic && !merged.align && !merged.bg && !merged.color;
+        if (isEmpty) delete formats[id];
+        else formats[id] = merged;
+      }
+      return { ...prev, formats };
+    });
+  }, [selectedCell, selectionRange, setSheet]);
+
+  const toggleBold = useCallback(() => {
+    const current = sheet.formats[selectedCell]?.bold;
+    applyFormat({ bold: !current });
+  }, [selectedCell, sheet.formats, applyFormat]);
+
+  const toggleItalic = useCallback(() => {
+    const current = sheet.formats[selectedCell]?.italic;
+    applyFormat({ italic: !current });
+  }, [selectedCell, sheet.formats, applyFormat]);
+
+  // ── Sheet tabs ──────────────────────────────────────────────────────
+
+  const addSheet = useCallback(() => {
+    setWorkbook((wb) => {
+      const name = `Sheet ${wb.sheets.length + 1}`;
+      return { sheets: [...wb.sheets, makeSheet(name)], activeSheet: wb.sheets.length };
+    });
+    setSelectedCell("A1");
+    setSelectionEnd(null);
+    setFormulaBarValue("");
+  }, []);
+
+  const switchSheet = useCallback((index: number) => {
+    if (editingCell) commitEdit();
+    setWorkbook((wb) => ({ ...wb, activeSheet: index }));
+    setSelectedCell("A1");
+    setSelectionEnd(null);
+    setFormulaBarValue("");
+  }, [editingCell, commitEdit]);
+
+  const renameSheet = useCallback((index: number) => {
+    const current = workbook.sheets[index]?.name ?? "";
+    const name = prompt("Sheet name:", current);
+    if (name && name !== current) {
+      setWorkbook((wb) => {
+        const sheets = [...wb.sheets];
+        sheets[index] = { ...sheets[index]!, name };
+        return { ...wb, sheets };
+      });
+    }
+  }, [workbook.sheets]);
+
+  const deleteSheet = useCallback((index: number) => {
+    if (workbook.sheets.length <= 1) return;
+    setWorkbook((wb) => {
+      const sheets = wb.sheets.filter((_, i) => i !== index);
+      const activeSheet = wb.activeSheet >= sheets.length ? sheets.length - 1 : wb.activeSheet;
+      return { sheets, activeSheet };
+    });
+    setSelectedCell("A1");
+    setSelectionEnd(null);
+  }, [workbook.sheets.length]);
 
   // ── Column resize ───────────────────────────────────────────────────
 
@@ -1012,11 +1133,13 @@ export function App() {
             if (v) cells[cellId(c, r)] = v;
           }
         }
-        setSheet({
+        setSheet((prev) => ({
+          ...prev,
           cells,
+          formats: {},
           colCount: Math.max(DEFAULT_COLS, maxCol + 1),
           rowCount: Math.max(DEFAULT_ROWS, lines.length),
-        });
+        }));
         setSelectedCell("A1");
         setFormulaBarValue(cells["A1"] ?? "");
       };
@@ -1144,6 +1267,151 @@ export function App() {
         />
       </div>
 
+      {/* Formatting toolbar */}
+      <div
+        style={{
+          display: "flex", alignItems: "center", gap: "0.25rem",
+          padding: "0.25rem 0.75rem",
+          borderBottom: "1px solid var(--color-line)",
+          background: "var(--color-panel)", flexShrink: 0, flexWrap: "wrap",
+        }}
+      >
+        {[
+          { label: "B", title: "Bold (Ctrl+B)", active: sheet.formats[selectedCell]?.bold, action: toggleBold, style: { fontWeight: 800 } as React.CSSProperties },
+          { label: "I", title: "Italic (Ctrl+I)", active: sheet.formats[selectedCell]?.italic, action: toggleItalic, style: { fontStyle: "italic" } as React.CSSProperties },
+        ].map(({ label, title, active, action, style }) => (
+          <button
+            key={label}
+            title={title}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={action}
+            style={{
+              width: "1.75rem", height: "1.75rem",
+              border: active ? "1px solid var(--color-accent)" : "1px solid var(--color-line)",
+              borderRadius: "0.25rem",
+              background: active ? "rgba(192,133,82,0.12)" : "transparent",
+              color: active ? "var(--color-accent)" : "var(--color-muted)",
+              cursor: "pointer", fontSize: "0.8125rem",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              ...style,
+            }}
+          >
+            {label}
+          </button>
+        ))}
+        <span style={{ width: 1, height: "1rem", background: "var(--color-line)", margin: "0 0.25rem" }} />
+        {(["left", "center", "right"] as const).map((a) => (
+          <button
+            key={a}
+            title={`Align ${a}`}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => applyFormat({ align: sheet.formats[selectedCell]?.align === a ? undefined : a })}
+            style={{
+              width: "1.75rem", height: "1.75rem",
+              border: sheet.formats[selectedCell]?.align === a ? "1px solid var(--color-accent)" : "1px solid var(--color-line)",
+              borderRadius: "0.25rem",
+              background: sheet.formats[selectedCell]?.align === a ? "rgba(192,133,82,0.12)" : "transparent",
+              color: sheet.formats[selectedCell]?.align === a ? "var(--color-accent)" : "var(--color-muted)",
+              cursor: "pointer", fontSize: "0.6875rem", fontWeight: 600,
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}
+          >
+            {a === "left" ? "⫷" : a === "center" ? "⫶" : "⫸"}
+          </button>
+        ))}
+        <span style={{ width: 1, height: "1rem", background: "var(--color-line)", margin: "0 0.25rem" }} />
+        {/* Background color */}
+        <div style={{ position: "relative" }}>
+          <button
+            title="Background color"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              setColorPicker(colorPicker?.type === "bg" ? null : { type: "bg", x: rect.left, y: rect.bottom + 4 });
+            }}
+            style={{
+              width: "1.75rem", height: "1.75rem",
+              border: "1px solid var(--color-line)", borderRadius: "0.25rem",
+              background: "transparent", cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: "0.75rem", color: "var(--color-muted)",
+            }}
+          >
+            <span style={{ display: "block", width: 12, height: 12, borderRadius: 2, background: sheet.formats[selectedCell]?.bg || "var(--color-line)" }} />
+          </button>
+        </div>
+        {/* Text color */}
+        <div style={{ position: "relative" }}>
+          <button
+            title="Text color"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              setColorPicker(colorPicker?.type === "color" ? null : { type: "color", x: rect.left, y: rect.bottom + 4 });
+            }}
+            style={{
+              width: "1.75rem", height: "1.75rem",
+              border: "1px solid var(--color-line)", borderRadius: "0.25rem",
+              background: "transparent", cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: "0.8125rem", fontWeight: 700,
+              color: sheet.formats[selectedCell]?.color || "var(--color-muted)",
+            }}
+          >
+            A
+          </button>
+        </div>
+        <span style={{ width: 1, height: "1rem", background: "var(--color-line)", margin: "0 0.25rem" }} />
+        <button
+          title="Keyboard shortcuts (?)"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => setShowHelp((p) => !p)}
+          style={{
+            width: "1.75rem", height: "1.75rem",
+            border: "1px solid var(--color-line)", borderRadius: "0.25rem",
+            background: "transparent", color: "var(--color-muted)", cursor: "pointer",
+            fontSize: "0.8125rem", fontWeight: 600,
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}
+        >
+          ?
+        </button>
+      </div>
+
+      {/* Color picker popup */}
+      {colorPicker && (
+        <div
+          style={{
+            position: "fixed", left: colorPicker.x, top: colorPicker.y, zIndex: 100,
+            background: "var(--color-paper)", border: "1px solid var(--color-line)",
+            borderRadius: "var(--radius-btn)", boxShadow: "0 4px 16px rgba(0,0,0,0.12)",
+            padding: "0.5rem", display: "grid", gridTemplateColumns: "repeat(6, 1.5rem)", gap: "0.25rem",
+          }}
+        >
+          {[
+            undefined, "#ef4444", "#f97316", "#eab308", "#22c55e", "#3b82f6",
+            "#8b5cf6", "#ec4899", "#14b8a6", "#6b7280", "#1e293b", "#fefce8",
+            "#fee2e2", "#dbeafe", "#dcfce7", "#f3e8ff", "#fef3c7",
+          ].map((c, i) => (
+            <button
+              key={i}
+              onClick={() => {
+                applyFormat({ [colorPicker.type]: c });
+                setColorPicker(null);
+              }}
+              style={{
+                width: "1.5rem", height: "1.5rem",
+                border: c ? "1px solid var(--color-line)" : "2px dashed var(--color-muted)",
+                borderRadius: "0.25rem",
+                background: c ?? "transparent",
+                cursor: "pointer",
+              }}
+              title={c ?? "Clear"}
+            />
+          ))}
+        </div>
+      )}
+
       {/* Grid */}
       <div
         ref={gridRef}
@@ -1234,6 +1502,7 @@ export function App() {
                   const isPointed = pointHighlight.has(id);
                   const inRange = selectionRange?.cells.has(id) ?? false;
                   const display = displayValues[id] ?? "";
+                  const fmt = sheet.formats[id];
                   const isNum = !isNaN(parseFloat(display)) && display !== "" && !isError(display);
                   const isFindMatch = findMatches.includes(id);
                   const isCurrentMatch = isFindMatch && findMatches[findIndex] === id;
@@ -1267,7 +1536,7 @@ export function App() {
                               ? "rgba(91,140,214,0.12)"
                               : inRange && !isSelected
                                 ? "rgba(192,133,82,0.10)"
-                                : zebraColor,
+                                : fmt?.bg ?? zebraColor,
                         zIndex: isSelected || isPointed ? 1 : 0,
                         cursor: "cell",
                       }}
@@ -1299,9 +1568,10 @@ export function App() {
                             overflow: "hidden",
                             textOverflow: "ellipsis",
                             whiteSpace: "nowrap",
-                            color: isError(display) ? "#d94040" : "var(--color-ink)",
-                            textAlign: isNum ? "right" : "left",
-                            fontWeight: isError(display) ? 600 : 400,
+                            color: isError(display) ? "#d94040" : fmt?.color ?? "var(--color-ink)",
+                            textAlign: fmt?.align ?? (isNum ? "right" : "left"),
+                            fontWeight: fmt?.bold ? 700 : isError(display) ? 600 : 400,
+                            fontStyle: fmt?.italic ? "italic" : undefined,
                           }}
                         >
                           {formatDisplay(display)}
@@ -1381,6 +1651,48 @@ export function App() {
         </div>
       )}
 
+      {/* Sheet tabs */}
+      <div
+        style={{
+          display: "flex", alignItems: "center",
+          borderTop: "1px solid var(--color-line)",
+          background: "var(--color-panel)", flexShrink: 0,
+          overflowX: "auto", minHeight: "1.75rem",
+        }}
+      >
+        {workbook.sheets.map((s, i) => (
+          <button
+            key={i}
+            onClick={() => switchSheet(i)}
+            onDoubleClick={() => renameSheet(i)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              if (workbook.sheets.length > 1 && confirm(`Delete "${s.name}"?`)) deleteSheet(i);
+            }}
+            style={{
+              padding: "0.25rem 0.75rem",
+              fontSize: "0.6875rem", fontWeight: i === workbook.activeSheet ? 700 : 400,
+              border: "none", borderRight: "1px solid var(--color-line)",
+              background: i === workbook.activeSheet ? "var(--color-paper)" : "transparent",
+              color: i === workbook.activeSheet ? "var(--color-ink)" : "var(--color-muted)",
+              cursor: "pointer", whiteSpace: "nowrap",
+            }}
+          >
+            {s.name}
+          </button>
+        ))}
+        <button
+          onClick={addSheet}
+          style={{
+            padding: "0.25rem 0.5rem", fontSize: "0.8125rem", fontWeight: 600,
+            border: "none", background: "transparent",
+            color: "var(--color-muted)", cursor: "pointer",
+          }}
+        >
+          +
+        </button>
+      </div>
+
       {/* Status bar */}
       <div
         style={{
@@ -1452,6 +1764,78 @@ export function App() {
           </div>
         );
       })()}
+
+      {/* Help dialog */}
+      {showHelp && (
+        <div
+          onClick={() => setShowHelp(false)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 200,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "var(--color-paper)", borderRadius: "var(--radius-card)",
+              padding: "1.5rem", maxWidth: "28rem", width: "90vw",
+              maxHeight: "80vh", overflow: "auto",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.2)",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
+              <h2 style={{ margin: 0, fontSize: "1.125rem" }}>Keyboard Shortcuts</h2>
+              <button onClick={() => setShowHelp(false)} style={{ border: "none", background: "transparent", fontSize: "1.25rem", cursor: "pointer", color: "var(--color-muted)" }}>×</button>
+            </div>
+            {[
+              ["Navigation", [
+                ["Arrow keys", "Move selection"],
+                ["Shift + Arrow", "Extend selection"],
+                ["Tab / Shift+Tab", "Move right / left"],
+                ["Enter / Shift+Enter", "Move down / up"],
+                ["Ctrl+A", "Select all"],
+              ]],
+              ["Editing", [
+                ["Type any character", "Start editing cell"],
+                ["F2 / Enter", "Edit selected cell"],
+                ["Escape", "Cancel edit"],
+                ["Delete / Backspace", "Clear cell(s)"],
+              ]],
+              ["Formulas", [
+                ["= then Arrow keys", "Insert cell reference"],
+                ["Shift + Arrow (in formula)", "Extend to range (A1:B3)"],
+                ["Click cell (in formula)", "Insert cell reference"],
+              ]],
+              ["Formatting", [
+                ["Ctrl+B", "Bold"],
+                ["Ctrl+I", "Italic"],
+              ]],
+              ["Tools", [
+                ["Ctrl+C / X / V", "Copy / Cut / Paste"],
+                ["Ctrl+Z", "Undo"],
+                ["Ctrl+Shift+Z / Ctrl+Y", "Redo"],
+                ["Ctrl+F", "Find"],
+                ["Ctrl+H", "Find & Replace"],
+                ["Right-click", "Context menu (insert/delete/sort)"],
+                ["?", "This help"],
+              ]],
+            ].map(([title, shortcuts]) => (
+              <div key={title as string} style={{ marginBottom: "0.75rem" }}>
+                <div style={{ fontSize: "0.75rem", fontWeight: 700, color: "var(--color-accent)", marginBottom: "0.25rem", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                  {title as string}
+                </div>
+                {(shortcuts as string[][]).map(([key, desc]) => (
+                  <div key={key} style={{ display: "flex", justifyContent: "space-between", padding: "0.125rem 0", fontSize: "0.8125rem" }}>
+                    <code style={{ background: "var(--color-panel)", padding: "0.05rem 0.375rem", borderRadius: "0.25rem", fontSize: "0.75rem" }}>{key}</code>
+                    <span style={{ color: "var(--color-muted)" }}>{desc}</span>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
