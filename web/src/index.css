@@ -12,6 +12,7 @@
   --color-muted: #8a8780;
   --color-line: #e8e5e0;
   --color-panel: #f5f3f0;
+  --color-zebra: rgba(0,0,0,0.02);
   --radius-card: 1.25rem;
   --radius-btn: 0.75rem;
 }
@@ -25,6 +26,7 @@
     --color-muted: #7a7770;
     --color-line: #2a2825;
     --color-panel: #1a1918;
+    --color-zebra: rgba(255,255,255,0.02);
   }
 }
 

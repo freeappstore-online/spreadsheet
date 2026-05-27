@@ -293,18 +293,21 @@ function splice(str: string, start: number, end: number, insert: string): string
 export function App() {
   const [sheet, setSheet] = useState<SheetData>(loadSheet);
   const [selectedCell, setSelectedCell] = useState<string>("A1");
+  const [selectionEnd, setSelectionEnd] = useState<string | null>(null);
   const [editingCell, setEditingCell] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
   const [formulaBarValue, setFormulaBarValue] = useState("");
   const [formulaBarFocused, setFormulaBarFocused] = useState(false);
   const [pointMode, setPointMode] = useState<PointMode | null>(null);
-  const [clipboard, setClipboard] = useState<{ type: "copy" | "cut"; id: string; value: string } | null>(null);
+  const [clipboard, setClipboard] = useState<{ type: "copy" | "cut"; ids: string[]; values: Record<string, string> } | null>(null);
   const [, setUndoStack] = useState<Record<string, string>[]>([]);
+  const [colWidths, setColWidths] = useState<Record<number, number>>({});
 
   const editInputRef = useRef<HTMLInputElement>(null);
   const formulaBarRef = useRef<HTMLInputElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const pendingCursorPos = useRef<number | null>(null);
+  const resizingCol = useRef<{ col: number; startX: number; startW: number } | null>(null);
 
   // ── Persistence ─────────────────────────────────────────────────────
 
@@ -339,6 +342,20 @@ export function App() {
     return result;
   }, [sheet.cells]);
 
+  const selectionRange = useMemo<{ minC: number; maxC: number; minR: number; maxR: number; cells: Set<string> } | null>(() => {
+    if (!selectionEnd) return null;
+    const a = parseCellRef(selectedCell);
+    const b = parseCellRef(selectionEnd);
+    if (!a || !b) return null;
+    const minC = Math.min(a.col, b.col), maxC = Math.max(a.col, b.col);
+    const minR = Math.min(a.row, b.row), maxR = Math.max(a.row, b.row);
+    const s = new Set<string>();
+    for (let r = minR; r <= maxR; r++)
+      for (let c = minC; c <= maxC; c++)
+        s.add(cellId(c, r));
+    return { minC, maxC, minR, maxR, cells: s };
+  }, [selectedCell, selectionEnd]);
+
   const pointHighlight = useMemo<Set<string>>(() => {
     if (!pointMode) return new Set();
     const a = pointMode.anchor, b = pointMode.active;
@@ -350,6 +367,23 @@ export function App() {
     }
     return s;
   }, [pointMode]);
+
+  // Status bar: SUM / AVG / COUNT for selection
+  const selectionStats = useMemo(() => {
+    const ids = selectionRange ? [...selectionRange.cells] : [selectedCell];
+    const nums: number[] = [];
+    let count = 0;
+    for (const id of ids) {
+      const d = displayValues[id] ?? "";
+      if (d === "") continue;
+      count++;
+      const n = parseFloat(d);
+      if (!isNaN(n)) nums.push(n);
+    }
+    if (nums.length === 0) return { sum: 0, avg: 0, count, numCount: 0 };
+    const sum = nums.reduce((a, b) => a + b, 0);
+    return { sum, avg: sum / nums.length, count, numCount: nums.length };
+  }, [selectedCell, selectionRange, displayValues]);
 
   // ── Undo ────────────────────────────────────────────────────────────
 
@@ -413,6 +447,7 @@ export function App() {
 
   const select = useCallback((id: string) => {
     setSelectedCell(id);
+    setSelectionEnd(null);
     setFormulaBarValue(sheet.cells[id] ?? "");
   }, [sheet.cells]);
 
@@ -425,6 +460,17 @@ export function App() {
     );
     select(id);
   }, [selectedCell, sheet.colCount, sheet.rowCount, select]);
+
+  const extendSelection = useCallback((dCol: number, dRow: number) => {
+    const end = selectionEnd ?? selectedCell;
+    const parsed = parseCellRef(end);
+    if (!parsed) return;
+    const newId = cellId(
+      clamp(parsed.col + dCol, sheet.colCount),
+      clamp(parsed.row + dRow, sheet.rowCount),
+    );
+    setSelectionEnd(newId);
+  }, [selectedCell, selectionEnd, sheet.colCount, sheet.rowCount]);
 
   // Commit current edit, then move selection and focus grid
   const commitAndMove = useCallback((dCol: number, dRow: number) => {
@@ -527,9 +573,12 @@ export function App() {
       commitEdit();
     }
 
-    select(id);
+    if (e.shiftKey && !editingCell) {
+      setSelectionEnd(id);
+    } else {
+      select(id);
+    }
     if (!editingCell) {
-      // Ensure grid gets focus when selecting (not editing)
       gridRef.current?.focus();
     }
   }, [editingCell, editValue, insertRefByClick, commitEdit, select]);
@@ -545,26 +594,56 @@ export function App() {
 
     if (meta && e.key === "c") {
       e.preventDefault();
-      setClipboard({ type: "copy", id: selectedCell, value: sheet.cells[selectedCell] ?? "" });
+      const ids = selectionRange ? [...selectionRange.cells] : [selectedCell];
+      const vals: Record<string, string> = {};
+      for (const id of ids) { const v = sheet.cells[id]; if (v) vals[id] = v; }
+      setClipboard({ type: "copy", ids, values: vals });
       return;
     }
     if (meta && e.key === "x") {
       e.preventDefault();
-      setClipboard({ type: "cut", id: selectedCell, value: sheet.cells[selectedCell] ?? "" });
+      const ids = selectionRange ? [...selectionRange.cells] : [selectedCell];
+      const vals: Record<string, string> = {};
+      for (const id of ids) { const v = sheet.cells[id]; if (v) vals[id] = v; }
+      setClipboard({ type: "cut", ids, values: vals });
       return;
     }
     if (meta && e.key === "v" && clipboard) {
       e.preventDefault();
-      writeCell(selectedCell, clipboard.value);
-      if (clipboard.type === "cut") { writeCell(clipboard.id, ""); setClipboard(null); }
+      const target = parseCellRef(selectedCell);
+      const first = parseCellRef(clipboard.ids[0] ?? "A1");
+      if (target && first) {
+        pushUndo();
+        const dC = target.col - first.col, dR = target.row - first.row;
+        setSheet((prev) => {
+          const next = { ...prev, cells: { ...prev.cells } };
+          for (const [srcId, val] of Object.entries(clipboard.values)) {
+            const src = parseCellRef(srcId);
+            if (src) {
+              const destId = cellId(src.col + dC, src.row + dR);
+              next.cells[destId] = val;
+            }
+          }
+          if (clipboard.type === "cut") {
+            for (const id of clipboard.ids) delete next.cells[id];
+          }
+          return next;
+        });
+        if (clipboard.type === "cut") setClipboard(null);
+      }
+      return;
+    }
+    if (meta && e.key === "a") {
+      e.preventDefault();
+      setSelectionEnd(cellId(sheet.colCount - 1, sheet.rowCount - 1));
       return;
     }
 
     switch (e.key) {
-      case "ArrowUp":    e.preventDefault(); move(0, -1); break;
-      case "ArrowDown":  e.preventDefault(); move(0, 1); break;
-      case "ArrowLeft":  e.preventDefault(); move(-1, 0); break;
-      case "ArrowRight": e.preventDefault(); move(1, 0); break;
+      case "ArrowUp":    e.preventDefault(); e.shiftKey ? extendSelection(0, -1) : move(0, -1); break;
+      case "ArrowDown":  e.preventDefault(); e.shiftKey ? extendSelection(0, 1) : move(0, 1); break;
+      case "ArrowLeft":  e.preventDefault(); e.shiftKey ? extendSelection(-1, 0) : move(-1, 0); break;
+      case "ArrowRight": e.preventDefault(); e.shiftKey ? extendSelection(1, 0) : move(1, 0); break;
       case "Tab":        e.preventDefault(); move(e.shiftKey ? -1 : 1, 0); break;
       case "Enter":
       case "F2":
@@ -572,10 +651,17 @@ export function App() {
         startEditing(selectedCell);
         break;
       case "Delete":
-      case "Backspace":
-        writeCell(selectedCell, "");
+      case "Backspace": {
+        const ids = selectionRange ? [...selectionRange.cells] : [selectedCell];
+        pushUndo();
+        setSheet((prev) => {
+          const next = { ...prev, cells: { ...prev.cells } };
+          for (const id of ids) delete next.cells[id];
+          return next;
+        });
         setFormulaBarValue("");
         break;
+      }
       default:
         // Any printable character starts editing with that character
         if (e.key.length === 1 && !meta) {
@@ -583,7 +669,7 @@ export function App() {
           startEditing(selectedCell, e.key);
         }
     }
-  }, [selectedCell, sheet.cells, clipboard, move, startEditing, writeCell, undo]);
+  }, [selectedCell, selectionRange, sheet.cells, sheet.colCount, sheet.rowCount, clipboard, move, extendSelection, startEditing, writeCell, pushUndo, undo]);
 
   // ── Keyboard: inline cell input ─────────────────────────────────────
 
@@ -668,6 +754,42 @@ export function App() {
     gridRef.current?.focus();
   }, [editingCell, cancelEdit, pushUndo]);
 
+  // ── Column resize ───────────────────────────────────────────────────
+
+  const getColWidth = useCallback((c: number) => colWidths[c] ?? COL_WIDTH, [colWidths]);
+
+  const handleColResizeStart = useCallback((col: number, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startW = colWidths[col] ?? COL_WIDTH;
+    resizingCol.current = { col, startX, startW };
+
+    const onMove = (ev: MouseEvent) => {
+      if (!resizingCol.current) return;
+      const diff = ev.clientX - resizingCol.current.startX;
+      const newW = Math.max(40, resizingCol.current.startW + diff);
+      setColWidths((prev) => ({ ...prev, [resizingCol.current!.col]: newW }));
+    };
+    const onUp = () => {
+      resizingCol.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [colWidths]);
+
+  const handleColResizeDoubleClick = useCallback((col: number) => {
+    let maxW = 50;
+    for (let r = 0; r < sheet.rowCount; r++) {
+      const id = cellId(col, r);
+      const d = displayValues[id] ?? "";
+      maxW = Math.max(maxW, d.length * 8 + 16);
+    }
+    setColWidths((prev) => ({ ...prev, [col]: Math.min(maxW, 400) }));
+  }, [sheet.rowCount, displayValues]);
+
   // ── CSV export / import ──────────────────────────────────────────────
 
   const exportCsv = useCallback(() => {
@@ -732,6 +854,21 @@ export function App() {
     };
     input.click();
   }, [pushUndo]);
+
+  // ── Number formatting ────────────────────────────────────────────────
+
+  const formatDisplay = useCallback((val: string): string => {
+    if (!val || val.startsWith("#")) return val;
+    const num = parseFloat(val);
+    if (isNaN(num) || val !== String(num)) return val;
+    if (Number.isInteger(num) && Math.abs(num) >= 1000) {
+      return num.toLocaleString("en-US");
+    }
+    if (!Number.isInteger(num)) {
+      return num.toLocaleString("en-US", { maximumFractionDigits: 10 });
+    }
+    return val;
+  }, []);
 
   // ── Render helpers ──────────────────────────────────────────────────
 
@@ -847,7 +984,7 @@ export function App() {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: `${HEADER_WIDTH}px repeat(${sheet.colCount}, ${COL_WIDTH}px)`,
+            gridTemplateColumns: `${HEADER_WIDTH}px ${Array.from({ length: sheet.colCount }, (_, c) => `${getColWidth(c)}px`).join(" ")}`,
             gridTemplateRows: `${ROW_HEIGHT}px repeat(${sheet.rowCount}, ${ROW_HEIGHT}px)`,
             width: "fit-content",
             minWidth: "100%",
@@ -861,114 +998,167 @@ export function App() {
             borderRight: "1px solid var(--color-line)",
           }} />
 
-          {/* Column headers */}
-          {Array.from({ length: sheet.colCount }, (_, c) => (
-            <div
-              key={`ch-${c}`}
-              style={{
-                position: "sticky", top: 0, zIndex: 2,
-                display: "flex", alignItems: "center", justifyContent: "center",
-                background: "var(--color-panel)",
-                borderBottom: "2px solid var(--color-line)",
-                borderRight: "1px solid var(--color-line)",
-                fontSize: "0.6875rem", fontWeight: 600, color: "var(--color-muted)",
-                userSelect: "none",
-              }}
-            >
-              {colLabel(c)}
-            </div>
-          ))}
-
-          {/* Rows */}
-          {Array.from({ length: sheet.rowCount }, (_, r) => (
-            <>
-              {/* Row header */}
+          {/* Column headers with resize handles */}
+          {Array.from({ length: sheet.colCount }, (_, c) => {
+            const colSel = selectionRange
+              ? c >= selectionRange.minC && c <= selectionRange.maxC
+              : parseCellRef(selectedCell)?.col === c;
+            return (
               <div
-                key={`rh-${r}`}
+                key={`ch-${c}`}
                 style={{
-                  position: "sticky", left: 0, zIndex: 1,
+                  position: "sticky", top: 0, zIndex: 2,
                   display: "flex", alignItems: "center", justifyContent: "center",
-                  background: "var(--color-panel)",
-                  borderBottom: "1px solid var(--color-line)",
+                  background: colSel ? "var(--color-line)" : "var(--color-panel)",
+                  borderBottom: "2px solid var(--color-line)",
                   borderRight: "1px solid var(--color-line)",
-                  fontSize: "0.6875rem", fontWeight: 500, color: "var(--color-muted)",
+                  fontSize: "0.6875rem", fontWeight: 600,
+                  color: colSel ? "var(--color-ink)" : "var(--color-muted)",
                   userSelect: "none",
                 }}
               >
-                {r + 1}
+                {colLabel(c)}
+                <div
+                  onMouseDown={(e) => handleColResizeStart(c, e)}
+                  onDoubleClick={() => handleColResizeDoubleClick(c)}
+                  style={{
+                    position: "absolute", right: -2, top: 0, bottom: 0, width: 5,
+                    cursor: "col-resize", zIndex: 4,
+                  }}
+                />
               </div>
+            );
+          })}
 
-              {/* Cells */}
-              {Array.from({ length: sheet.colCount }, (_, c) => {
-                const id = cellId(c, r);
-                const isSelected = selectedCell === id;
-                const isEditing = editingCell === id;
-                const isPointed = pointHighlight.has(id);
-                const display = displayValues[id] ?? "";
+          {/* Rows */}
+          {Array.from({ length: sheet.rowCount }, (_, r) => {
+            const rowSel = selectionRange
+              ? r >= selectionRange.minR && r <= selectionRange.maxR
+              : parseCellRef(selectedCell)?.row === r;
+            return (
+              <>
+                {/* Row header */}
+                <div
+                  key={`rh-${r}`}
+                  style={{
+                    position: "sticky", left: 0, zIndex: 1,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    background: rowSel ? "var(--color-line)" : "var(--color-panel)",
+                    borderBottom: "1px solid var(--color-line)",
+                    borderRight: "1px solid var(--color-line)",
+                    fontSize: "0.6875rem", fontWeight: 500,
+                    color: rowSel ? "var(--color-ink)" : "var(--color-muted)",
+                    userSelect: "none",
+                  }}
+                >
+                  {r + 1}
+                </div>
 
-                return (
-                  <div
-                    key={id}
-                    onMouseDown={(e) => handleCellMouseDown(id, e)}
-                    onDoubleClick={() => {
-                      if (!editingCell) startEditing(id);
-                    }}
-                    style={{
-                      position: "relative",
-                      borderBottom: "1px solid var(--color-line)",
-                      borderRight: "1px solid var(--color-line)",
-                      outline: isSelected
-                        ? "2px solid var(--color-accent)"
-                        : isPointed
-                          ? "2px solid #5b8cd6"
-                          : "none",
-                      outlineOffset: "-1px",
-                      background: isPointed && !isSelected ? "rgba(91,140,214,0.12)" : undefined,
-                      zIndex: isSelected || isPointed ? 1 : 0,
-                      cursor: "cell",
-                    }}
-                  >
-                    {isEditing ? (
-                      <input
-                        ref={editInputRef}
-                        value={editValue}
-                        onChange={(e) => {
-                          if (pointMode) setPointMode(null);
-                          setEditValue(e.target.value);
-                        }}
-                        onKeyDown={handleInputKeyDown}
-                        style={{
-                          position: "absolute", inset: 0,
-                          border: "none", outline: "none",
-                          background: "var(--color-paper)",
-                          padding: "0 4px", fontSize: "0.8125rem",
-                          color: "var(--color-ink)",
-                          width: "100%", height: "100%",
-                        }}
-                      />
-                    ) : (
-                      <div
-                        style={{
-                          padding: "0 4px",
-                          fontSize: "0.8125rem",
-                          lineHeight: `${ROW_HEIGHT}px`,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                          color: isError(display) ? "#d94040" : "var(--color-ink)",
-                          textAlign: !isNaN(parseFloat(display)) && display !== "" && !isError(display) ? "right" : "left",
-                          fontWeight: isError(display) ? 600 : 400,
-                        }}
-                      >
-                        {display}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </>
-          ))}
+                {/* Cells */}
+                {Array.from({ length: sheet.colCount }, (_, c) => {
+                  const id = cellId(c, r);
+                  const isSelected = selectedCell === id;
+                  const isEditing = editingCell === id;
+                  const isPointed = pointHighlight.has(id);
+                  const inRange = selectionRange?.cells.has(id) ?? false;
+                  const display = displayValues[id] ?? "";
+                  const isNum = !isNaN(parseFloat(display)) && display !== "" && !isError(display);
+                  const zebraColor = r % 2 === 1 ? "var(--color-zebra)" : undefined;
+
+                  return (
+                    <div
+                      key={id}
+                      onMouseDown={(e) => handleCellMouseDown(id, e)}
+                      onDoubleClick={() => { if (!editingCell) startEditing(id); }}
+                      style={{
+                        position: "relative",
+                        borderBottom: "1px solid var(--color-line)",
+                        borderRight: "1px solid var(--color-line)",
+                        outline: isSelected
+                          ? "2px solid var(--color-accent)"
+                          : isPointed
+                            ? "2px solid #5b8cd6"
+                            : "none",
+                        outlineOffset: "-1px",
+                        background: isPointed && !isSelected
+                          ? "rgba(91,140,214,0.12)"
+                          : inRange && !isSelected
+                            ? "rgba(192,133,82,0.10)"
+                            : zebraColor,
+                        zIndex: isSelected || isPointed ? 1 : 0,
+                        cursor: "cell",
+                      }}
+                    >
+                      {isEditing ? (
+                        <input
+                          ref={editInputRef}
+                          value={editValue}
+                          onChange={(e) => {
+                            if (pointMode) setPointMode(null);
+                            setEditValue(e.target.value);
+                          }}
+                          onKeyDown={handleInputKeyDown}
+                          style={{
+                            position: "absolute", inset: 0,
+                            border: "none", outline: "none",
+                            background: "var(--color-paper)",
+                            padding: "0 4px", fontSize: "0.8125rem",
+                            color: "var(--color-ink)",
+                            width: "100%", height: "100%",
+                          }}
+                        />
+                      ) : (
+                        <div
+                          style={{
+                            padding: "0 4px",
+                            fontSize: "0.8125rem",
+                            lineHeight: `${ROW_HEIGHT}px`,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                            color: isError(display) ? "#d94040" : "var(--color-ink)",
+                            textAlign: isNum ? "right" : "left",
+                            fontWeight: isError(display) ? 600 : 400,
+                          }}
+                        >
+                          {formatDisplay(display)}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </>
+            );
+          })}
         </div>
+      </div>
+
+      {/* Status bar */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "1.25rem",
+          padding: "0.25rem 0.75rem",
+          borderTop: "1px solid var(--color-line)",
+          background: "var(--color-panel)",
+          flexShrink: 0,
+          minHeight: "1.5rem",
+          fontSize: "0.6875rem",
+          color: "var(--color-muted)",
+        }}
+      >
+        {selectionStats.numCount > 1 && (
+          <>
+            <span>Sum: <b style={{ color: "var(--color-ink)" }}>{selectionStats.sum.toLocaleString("en-US", { maximumFractionDigits: 4 })}</b></span>
+            <span>Avg: <b style={{ color: "var(--color-ink)" }}>{selectionStats.avg.toLocaleString("en-US", { maximumFractionDigits: 4 })}</b></span>
+          </>
+        )}
+        {selectionStats.count > 0 && (
+          <span>Count: <b style={{ color: "var(--color-ink)" }}>{selectionStats.count}</b></span>
+        )}
+        <div style={{ flex: 1 }} />
+        <span>{sheet.rowCount} rows × {sheet.colCount} cols</span>
       </div>
     </div>
   );
