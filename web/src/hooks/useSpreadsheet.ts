@@ -33,6 +33,8 @@ export function useSpreadsheet() {
   const [colorPicker, setColorPicker] = useState<{ type: "bg" | "color"; x: number; y: number } | null>(null);
   const [findMatches, setFindMatches] = useState<string[]>([]);
   const [findIndex, setFindIndex] = useState(0);
+  const [frozenRows, setFrozenRows] = useState(0);
+  const [autoFillTarget, setAutoFillTarget] = useState<string | null>(null);
 
   const editInputRef = useRef<HTMLInputElement>(null);
   const formulaBarRef = useRef<HTMLInputElement>(null);
@@ -696,6 +698,159 @@ export function useSpreadsheet() {
     applyFormat({ italic: !current });
   }, [selectedCell, sheet.formats, applyFormat]);
 
+  // ── Freeze panes ────────────────────────────────────────────────────
+
+  const toggleFreezeFirstRow = useCallback(() => {
+    setFrozenRows((n) => (n > 0 ? 0 : 1));
+  }, []);
+
+  // ── Auto-fill ───────────────────────────────────────────────────────
+  // Detect a series from source cells and extend it to target cells.
+
+  const detectSeries = useCallback((values: string[]): ((index: number) => string) | null => {
+    if (values.length === 0) return null;
+    const nums = values.map((v) => parseFloat(v));
+    const allNumeric = nums.every((n) => !isNaN(n));
+
+    if (allNumeric && values.length >= 2) {
+      const step = nums[1]! - nums[0]!;
+      const consistent = nums.every((n, i) => i === 0 || Math.abs(n - nums[i - 1]! - step) < 1e-9);
+      if (consistent) {
+        return (i) => {
+          const v = nums[nums.length - 1]! + step * (i + 1);
+          return Number.isInteger(v) ? String(v) : String(Math.round(v * 1e10) / 1e10);
+        };
+      }
+    }
+
+    if (allNumeric && values.length === 1) {
+      return (i) => String(nums[0]! + i + 1);
+    }
+
+    const trailingNumRe = /^(.*?)(\d+)$/;
+    const matches = values.map((v) => v.match(trailingNumRe));
+    const allTextNum = matches.every((m) => m !== null);
+    if (allTextNum && values.length >= 1) {
+      const prefix = matches[0]![1]!;
+      const samePrefix = matches.every((m) => m![1] === prefix);
+      if (samePrefix) {
+        const lastNum = parseInt(matches[matches.length - 1]![2]!, 10);
+        const step = values.length >= 2 ? parseInt(matches[1]![2]!, 10) - parseInt(matches[0]![2]!, 10) : 1;
+        return (i) => `${prefix}${lastNum + step * (i + 1)}`;
+      }
+    }
+
+    return (i) => values[i % values.length]!;
+  }, []);
+
+  const performAutoFill = useCallback((targetId: string) => {
+    if (!selectionRange) {
+      // Single cell source — extend to target
+      const src = parseCellRef(selectedCell);
+      const tgt = parseCellRef(targetId);
+      if (!src || !tgt) return;
+      const value = sheet.cells[selectedCell] ?? "";
+      if (!value) return;
+
+      const minC = Math.min(src.col, tgt.col), maxC = Math.max(src.col, tgt.col);
+      const minR = Math.min(src.row, tgt.row), maxR = Math.max(src.row, tgt.row);
+      const isVertical = src.col === tgt.col;
+      const isHorizontal = src.row === tgt.row;
+      if (!isVertical && !isHorizontal) return;
+
+      pushUndo();
+      setSheet((prev) => {
+        const cells = { ...prev.cells };
+        const sourceValues = [value];
+        const fillFn = detectSeries(sourceValues);
+        if (!fillFn) return prev;
+
+        if (isVertical) {
+          let idx = 0;
+          for (let r = src.row; r !== tgt.row; r += src.row < tgt.row ? 1 : -1) {
+            if (r === src.row) continue;
+            cells[cellId(src.col, r)] = fillFn(idx++);
+          }
+          cells[cellId(tgt.col, tgt.row)] = fillFn(idx);
+        } else {
+          let idx = 0;
+          for (let c = src.col; c !== tgt.col; c += src.col < tgt.col ? 1 : -1) {
+            if (c === src.col) continue;
+            cells[cellId(c, src.row)] = fillFn(idx++);
+          }
+          cells[cellId(tgt.col, tgt.row)] = fillFn(idx);
+        }
+        return { ...prev, cells };
+      });
+      setSelectionEnd(targetId);
+      void [minC, maxC, minR, maxR];
+      return;
+    }
+
+    // Range source — extend the pattern
+    const tgt = parseCellRef(targetId);
+    if (!tgt) return;
+    const srcMinC = selectionRange.minC, srcMaxC = selectionRange.maxC;
+    const srcMinR = selectionRange.minR, srcMaxR = selectionRange.maxR;
+
+    const fillDown = tgt.row > srcMaxR && tgt.col >= srcMinC && tgt.col <= srcMaxC;
+    const fillUp = tgt.row < srcMinR && tgt.col >= srcMinC && tgt.col <= srcMaxC;
+    const fillRight = tgt.col > srcMaxC && tgt.row >= srcMinR && tgt.row <= srcMaxR;
+    const fillLeft = tgt.col < srcMinC && tgt.row >= srcMinR && tgt.row <= srcMaxR;
+
+    if (!fillDown && !fillUp && !fillRight && !fillLeft) return;
+
+    pushUndo();
+    setSheet((prev) => {
+      const cells = { ...prev.cells };
+      if (fillDown || fillUp) {
+        for (let c = srcMinC; c <= srcMaxC; c++) {
+          const sourceValues: string[] = [];
+          for (let r = srcMinR; r <= srcMaxR; r++) {
+            sourceValues.push(prev.cells[cellId(c, r)] ?? "");
+          }
+          const fillFn = detectSeries(sourceValues);
+          if (!fillFn) continue;
+          if (fillDown) {
+            for (let r = srcMaxR + 1, i = 0; r <= tgt.row; r++, i++) {
+              cells[cellId(c, r)] = fillFn(i);
+            }
+          } else {
+            const reversed = sourceValues.slice().reverse();
+            const reverseFill = detectSeries(reversed);
+            if (!reverseFill) continue;
+            for (let r = srcMinR - 1, i = 0; r >= tgt.row; r--, i++) {
+              cells[cellId(c, r)] = reverseFill(i);
+            }
+          }
+        }
+      } else {
+        for (let r = srcMinR; r <= srcMaxR; r++) {
+          const sourceValues: string[] = [];
+          for (let c = srcMinC; c <= srcMaxC; c++) {
+            sourceValues.push(prev.cells[cellId(c, r)] ?? "");
+          }
+          const fillFn = detectSeries(sourceValues);
+          if (!fillFn) continue;
+          if (fillRight) {
+            for (let c = srcMaxC + 1, i = 0; c <= tgt.col; c++, i++) {
+              cells[cellId(c, r)] = fillFn(i);
+            }
+          } else {
+            const reversed = sourceValues.slice().reverse();
+            const reverseFill = detectSeries(reversed);
+            if (!reverseFill) continue;
+            for (let c = srcMinC - 1, i = 0; c >= tgt.col; c--, i++) {
+              cells[cellId(c, r)] = reverseFill(i);
+            }
+          }
+        }
+      }
+      return { ...prev, cells };
+    });
+    setSelectionEnd(targetId);
+  }, [selectedCell, selectionRange, sheet.cells, pushUndo, detectSeries]);
+
   // ── Sheet tabs ──────────────────────────────────────────────────────
 
   const addSheet = useCallback(() => {
@@ -940,6 +1095,11 @@ export function useSpreadsheet() {
     findMatches,
     findIndex,
     clipboard,
+    frozenRows,
+    autoFillTarget,
+    setAutoFillTarget,
+    toggleFreezeFirstRow,
+    performAutoFill,
 
     // Derived
     displayValues,

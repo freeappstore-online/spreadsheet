@@ -18,6 +18,11 @@ export function ContextMenu({ s }: { s: SpreadsheetState }) {
     { label: "---2", action: () => {} },
     { label: "Sort A → Z", action: () => s.sortByColumn(p.col, true) },
     { label: "Sort Z → A", action: () => s.sortByColumn(p.col, false) },
+    { label: "---3", action: () => {} },
+    {
+      label: s.frozenRows > 0 ? "Unfreeze first row" : "Freeze first row",
+      action: () => { s.toggleFreezeFirstRow(); s.setContextMenu(null); },
+    },
   ];
 
   return (

@@ -1,3 +1,4 @@
+import { useCallback } from "react";
 import { colLabel, cellId, parseCellRef } from "../lib/cell-refs";
 import type { SpreadsheetState } from "../hooks/useSpreadsheet";
 
@@ -8,6 +9,77 @@ export function Grid({ s }: { s: SpreadsheetState }) {
   const totalH = (s.sheet.rowCount + 1) * s.ROW_HEIGHT;
   const findSet = new Set(s.findMatches);
   const currentMatch = s.findMatches[s.findIndex];
+
+  // Auto-fill drag handle
+  const startAutoFill = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const gridEl = s.gridRef.current;
+    if (!gridEl) return;
+    const rect = gridEl.getBoundingClientRect();
+
+    const onMove = (ev: MouseEvent) => {
+      const x = ev.clientX - rect.left + gridEl.scrollLeft;
+      const y = ev.clientY - rect.top + gridEl.scrollTop;
+      if (y < s.ROW_HEIGHT || x < s.HEADER_WIDTH) return;
+      const r = Math.floor((y - s.ROW_HEIGHT) / s.ROW_HEIGHT);
+      let cx = s.HEADER_WIDTH;
+      let c = 0;
+      for (; c < s.sheet.colCount; c++) {
+        cx += s.getColWidth(c);
+        if (x < cx) break;
+      }
+      const targetId = cellId(Math.min(c, s.sheet.colCount - 1), Math.min(r, s.sheet.rowCount - 1));
+      s.setAutoFillTarget(targetId);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      // Read target from closure-fresh state via DOM attribute fallback
+      const tgt = (gridEl as HTMLDivElement & { _autoFillTarget?: string })._autoFillTarget;
+      if (tgt) s.performAutoFill(tgt);
+      s.setAutoFillTarget(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [s]);
+
+  // Determine auto-fill anchor cell (bottom-right of current selection / cell)
+  const anchorCell = s.selectionRange
+    ? cellId(s.selectionRange.maxC, s.selectionRange.maxR)
+    : s.selectedCell;
+  const anchor = parseCellRef(anchorCell);
+
+  // Auto-fill preview range (cells from selection edge to target)
+  const fillPreview = new Set<string>();
+  if (s.autoFillTarget) {
+    const tgt = parseCellRef(s.autoFillTarget);
+    const src = s.selectionRange ?? (anchor ? { minC: anchor.col, maxC: anchor.col, minR: anchor.row, maxR: anchor.row } : null);
+    if (tgt && src) {
+      if (tgt.row > src.maxR && tgt.col >= src.minC && tgt.col <= src.maxC) {
+        for (let r = src.maxR + 1; r <= tgt.row; r++)
+          for (let c = src.minC; c <= src.maxC; c++)
+            fillPreview.add(cellId(c, r));
+      } else if (tgt.row < src.minR && tgt.col >= src.minC && tgt.col <= src.maxC) {
+        for (let r = tgt.row; r < src.minR; r++)
+          for (let c = src.minC; c <= src.maxC; c++)
+            fillPreview.add(cellId(c, r));
+      } else if (tgt.col > src.maxC && tgt.row >= src.minR && tgt.row <= src.maxR) {
+        for (let c = src.maxC + 1; c <= tgt.col; c++)
+          for (let r = src.minR; r <= src.maxR; r++)
+            fillPreview.add(cellId(c, r));
+      } else if (tgt.col < src.minC && tgt.row >= src.minR && tgt.row <= src.maxR) {
+        for (let c = tgt.col; c < src.minC; c++)
+          for (let r = src.minR; r <= src.maxR; r++)
+            fillPreview.add(cellId(c, r));
+      }
+    }
+  }
+
+  // Stash target on grid element for the mouseup handler closure
+  if (s.gridRef.current) {
+    (s.gridRef.current as HTMLDivElement & { _autoFillTarget?: string | null })._autoFillTarget = s.autoFillTarget;
+  }
 
   return (
     <div
@@ -62,6 +134,8 @@ export function Grid({ s }: { s: SpreadsheetState }) {
         {Array.from({ length: s.endRow - s.startRow + 1 }, (_, i) => {
           const r = s.startRow + i;
           if (s.editingRow !== null && r !== s.editingRow && r === s.endRow && s.editingRow > s.endRow) return null;
+          // Skip rows that are covered by the frozen row stickied at the top
+          if (s.frozenRows > 0 && r < s.frozenRows) return null;
           const rowSel = s.selectionRange
             ? r >= s.selectionRange.minR && r <= s.selectionRange.maxR
             : parseCellRef(s.selectedCell)?.row === r;
@@ -90,6 +164,8 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                 const isNum = !isNaN(parseFloat(display)) && display !== "" && !isError(display);
                 const isFindMatch = findSet.has(id);
                 const isCurrentMatch = id === currentMatch;
+                const isFillPreview = fillPreview.has(id);
+                const isAnchor = id === anchorCell;
                 const zebraColor = r % 2 === 1 ? "var(--color-zebra)" : undefined;
                 const w = s.getColWidth(c);
 
@@ -111,10 +187,11 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                       outlineOffset: "-1px",
                       background: isCurrentMatch ? "rgba(255,180,0,0.35)"
                         : isFindMatch ? "rgba(255,220,80,0.2)"
+                        : isFillPreview ? "rgba(192,133,82,0.20)"
                         : isPointed && !isSelected ? "rgba(91,140,214,0.12)"
                         : inRange && !isSelected ? "rgba(192,133,82,0.10)"
                         : fmt?.bg ?? zebraColor,
-                      zIndex: isSelected || isPointed ? 1 : 0,
+                      zIndex: isSelected || isPointed || isAnchor ? 2 : 0,
                       cursor: "cell",
                     }}
                   >
@@ -142,6 +219,86 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                         {s.formatDisplay(display)}
                       </div>
                     )}
+                    {isAnchor && !isEditing && (
+                      <div
+                        onMouseDown={startAutoFill}
+                        title="Drag to fill"
+                        style={{
+                          position: "absolute", right: -3, bottom: -3, width: 8, height: 8,
+                          background: "var(--color-accent)",
+                          border: "1px solid var(--color-paper)",
+                          cursor: "crosshair", zIndex: 5,
+                        }}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })}
+
+        {/* Frozen rows -- rendered as sticky elements that stay below the column header */}
+        {s.frozenRows > 0 && Array.from({ length: s.frozenRows }, (_, r) => {
+          const rowSel = s.selectionRange
+            ? r >= s.selectionRange.minR && r <= s.selectionRange.maxR
+            : parseCellRef(s.selectedCell)?.row === r;
+          return (
+            <div key={`frozen-${r}`} style={{ position: "sticky", top: s.ROW_HEIGHT * (r + 1), zIndex: 9, height: s.ROW_HEIGHT, display: "flex", width: totalW, marginTop: -s.ROW_HEIGHT }}>
+              <div style={{
+                position: "sticky", left: 0, zIndex: 1, width: s.HEADER_WIDTH, flexShrink: 0,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                background: rowSel ? "var(--color-line)" : "var(--color-panel)",
+                borderBottom: "2px solid var(--color-accent)",
+                borderRight: "1px solid var(--color-line)",
+                fontSize: "0.6875rem", fontWeight: 500,
+                color: rowSel ? "var(--color-ink)" : "var(--color-muted)",
+                userSelect: "none",
+              }}>
+                {r + 1}
+              </div>
+              {Array.from({ length: s.sheet.colCount }, (_, c) => {
+                const id = cellId(c, r);
+                const isSelected = s.selectedCell === id;
+                const isPointed = s.pointHighlight.has(id);
+                const inRange = s.selectionRange?.cells.has(id) ?? false;
+                const display = s.displayValues[id] ?? "";
+                const fmt = s.sheet.formats[id];
+                const isNum = !isNaN(parseFloat(display)) && display !== "" && !isError(display);
+                const w = s.getColWidth(c);
+
+                return (
+                  <div
+                    key={c}
+                    onMouseDown={(e) => s.handleCellMouseDown(id, e)}
+                    onDoubleClick={() => { if (!s.editingCell) s.startEditing(id); }}
+                    onContextMenu={(e) => {
+                      e.preventDefault(); e.stopPropagation();
+                      s.select(id);
+                      s.setContextMenu({ x: e.clientX, y: e.clientY, cellId: id });
+                    }}
+                    style={{
+                      width: w, flexShrink: 0, position: "relative",
+                      borderBottom: "2px solid var(--color-accent)",
+                      borderRight: "1px solid var(--color-line)",
+                      outline: isSelected ? "2px solid var(--color-accent)" : isPointed ? "2px solid #5b8cd6" : "none",
+                      outlineOffset: "-1px",
+                      background: isPointed && !isSelected ? "rgba(91,140,214,0.12)"
+                        : inRange && !isSelected ? "rgba(192,133,82,0.10)"
+                        : fmt?.bg ?? "var(--color-paper)",
+                      cursor: "cell",
+                    }}
+                  >
+                    <div style={{
+                      padding: "0 4px", fontSize: "0.8125rem", lineHeight: `${s.ROW_HEIGHT}px`,
+                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      color: isError(display) ? "#d94040" : fmt?.color ?? "var(--color-ink)",
+                      textAlign: fmt?.align ?? (isNum ? "right" : "left"),
+                      fontWeight: fmt?.bold ? 700 : isError(display) ? 600 : 400,
+                      fontStyle: fmt?.italic ? "italic" : undefined,
+                    }}>
+                      {s.formatDisplay(display)}
+                    </div>
                   </div>
                 );
               })}
