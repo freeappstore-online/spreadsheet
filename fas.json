@@ -1,0 +1,6 @@
+{
+  "appId": "spreadsheet",
+  "applicationRoot": "web",
+  "outputPath": "web/dist",
+  "buildCommand": "pnpm build"
+}
