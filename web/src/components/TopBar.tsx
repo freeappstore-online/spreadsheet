@@ -6,7 +6,8 @@ export function TopBar({ s }: { s: SpreadsheetState }) {
       style={{
         display: "flex",
         alignItems: "center",
-        gap: "0.75rem",
+        flexWrap: "wrap",
+        gap: "0.5rem 0.75rem",
         padding: "0.5rem 0.75rem",
         borderBottom: "1px solid var(--color-line)",
         background: "var(--color-panel)",
@@ -34,6 +35,7 @@ export function TopBar({ s }: { s: SpreadsheetState }) {
             padding: "0.25rem 0.75rem",
             fontSize: "0.75rem",
             fontWeight: 600,
+            whiteSpace: "nowrap",
             cursor: "pointer",
           }}
         >
