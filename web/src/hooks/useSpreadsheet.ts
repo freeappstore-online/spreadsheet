@@ -6,6 +6,7 @@ import { computeDisplay } from "../lib/formula-engine";
 import { parseCsvLine } from "../lib/csv";
 import { isRefPosition, buildRefString, splice } from "../lib/point-mode";
 import { makeSheet, loadWorkbook, saveWorkbook } from "../lib/persistence";
+import { checkSheetName, clearCells, findSheetIndex, readRange, rectToA1, usedRange, writeCells } from "../lib/ai-tools";
 
 export function useSpreadsheet() {
   const [workbook, setWorkbook] = useState<WorkbookData>(loadWorkbook);
@@ -955,6 +956,90 @@ export function useSpreadsheet() {
     setSelectionEnd(null);
   }, [workbook.sheets.length]);
 
+  // ── Local AI tools ──────────────────────────────────────────────────
+  // Called from the desktop bridge outside React's event flow, so they read the latest state
+  // from refs and stay stable. Cell edits use the same undo stack as the user's edits.
+
+  const workbookRef = useRef(workbook);
+  workbookRef.current = workbook;
+  const selectionRef = useRef({ selectedCell, selectionEnd });
+  selectionRef.current = { selectedCell, selectionEnd };
+
+  const commitWorkbook = useCallback((next: WorkbookData) => {
+    workbookRef.current = next;
+    setWorkbook(next);
+  }, []);
+
+  const aiEditCells = useCallback((sheetName: string | undefined, edit: (s: Sheet) => { sheet: Sheet; range: string; [k: string]: unknown }) => {
+    const wb = workbookRef.current;
+    const idx = findSheetIndex(wb, sheetName);
+    const prev = wb.sheets[idx]!;
+    const { sheet: nextSheet, ...result } = edit(prev);
+    // Undo restores into the active sheet, so show the edited sheet.
+    if (idx !== wb.activeSheet) {
+      setEditingCell(null);
+      setPointMode(null);
+      setSelectedCell("A1");
+      setSelectionEnd(null);
+    }
+    undoStackRef.current = [...undoStackRef.current, { cells: { ...prev.cells }, formats: { ...prev.formats } }];
+    if (undoStackRef.current.length > MAX_UNDO) undoStackRef.current.shift();
+    redoStackRef.current = [];
+    const sheets = [...wb.sheets];
+    sheets[idx] = nextSheet;
+    commitWorkbook({ sheets, activeSheet: idx });
+    return { sheet: nextSheet.name, ...result };
+  }, [commitWorkbook]);
+
+  const ai = useMemo(() => {
+    const lookupIn = (wb: WorkbookData) => (name: string, ref: string) =>
+      wb.sheets.find((s) => s.name.toLowerCase() === name.toLowerCase())?.cells[ref] ?? "";
+    return {
+      listSheets: () => {
+        const wb = workbookRef.current;
+        const { selectedCell: a, selectionEnd: b } = selectionRef.current;
+        return {
+          activeSheet: wb.sheets[wb.activeSheet]!.name,
+          selection: b && b !== a ? `${a}:${b}` : a,
+          sheets: wb.sheets.map((s) => {
+            const used = usedRange(s);
+            return {
+              name: s.name,
+              usedRange: used ? rectToA1(used) : null,
+              filledCells: Object.keys(s.cells).length,
+              rows: s.rowCount,
+              columns: s.colCount,
+            };
+          }),
+        };
+      },
+      readRange: (sheetName: string | undefined, range: string) => {
+        const wb = workbookRef.current;
+        const sheet = wb.sheets[findSheetIndex(wb, sheetName)]!;
+        return { sheet: sheet.name, ...readRange(sheet, range, lookupIn(wb)) };
+      },
+      setCells: (sheetName: string | undefined, range: string, values: unknown) =>
+        aiEditCells(sheetName, (s) => writeCells(s, range, values)),
+      clearRange: (sheetName: string | undefined, range: string) =>
+        aiEditCells(sheetName, (s) => clearCells(s, range)),
+      addSheet: (name?: string) => {
+        const wb = workbookRef.current;
+        const finalName = checkSheetName(wb, name ?? `Sheet ${wb.sheets.length + 1}`);
+        commitWorkbook({ ...wb, sheets: [...wb.sheets, makeSheet(finalName)] });
+        return { name: finalName, sheets: wb.sheets.length + 1 };
+      },
+      renameSheet: (sheetName: string, newName: string) => {
+        const wb = workbookRef.current;
+        const idx = findSheetIndex(wb, sheetName);
+        const finalName = checkSheetName(wb, newName, idx);
+        const sheets = [...wb.sheets];
+        sheets[idx] = { ...sheets[idx]!, name: finalName };
+        commitWorkbook({ ...wb, sheets });
+        return { from: wb.sheets[idx]!.name, to: finalName };
+      },
+    };
+  }, [aiEditCells, commitWorkbook]);
+
   // ── Column resize ───────────────────────────────────────────────────
 
   const getColWidth = useCallback((c: number) => colWidths[c] ?? COL_WIDTH, [colWidths]);
@@ -1243,6 +1328,7 @@ export function useSpreadsheet() {
     insertCol,
     deleteCol,
     sortByColumn,
+    ai,
   };
 }
 

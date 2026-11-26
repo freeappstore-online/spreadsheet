@@ -10,6 +10,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@freeappstore/sdk": "^0.21.8",
     "react": "^19",
     "react-dom": "^19"
   },

@@ -1,4 +1,5 @@
 import { useSpreadsheet } from "./hooks/useSpreadsheet";
+import { useAiAccess } from "./hooks/useAiAccess";
 import { TopBar } from "./components/TopBar";
 import { FormulaBar } from "./components/FormulaBar";
 import { FormattingToolbar } from "./components/FormattingToolbar";
@@ -13,9 +14,10 @@ import { ConditionalFormatDialog } from "./components/ConditionalFormatDialog";
 
 export function App() {
   const s = useSpreadsheet();
+  const aiAccess = useAiAccess(s.ai);
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100dvh" }}>
-      <TopBar s={s} />
+      <TopBar s={s} aiAccess={aiAccess} />
       <FormulaBar s={s} />
       <FormattingToolbar s={s} />
       <ColorPicker s={s} />

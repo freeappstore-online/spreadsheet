@@ -1,6 +1,8 @@
 import type { SpreadsheetState } from "../hooks/useSpreadsheet";
+import type { useAiAccess } from "../hooks/useAiAccess";
+import { AiAccess } from "./AiAccess";
 
-export function TopBar({ s }: { s: SpreadsheetState }) {
+export function TopBar({ s, aiAccess }: { s: SpreadsheetState; aiAccess: ReturnType<typeof useAiAccess> }) {
   return (
     <div
       style={{
@@ -17,6 +19,7 @@ export function TopBar({ s }: { s: SpreadsheetState }) {
       <span style={{ fontFamily: "'Fraunces', Georgia, serif", fontWeight: 700, fontSize: "1.125rem", whiteSpace: "nowrap" }}>
         spreadsheet
       </span>
+      <AiAccess {...aiAccess} />
       <div style={{ flex: 1 }} />
       {[
         { label: "Import CSV", action: s.importCsv },
