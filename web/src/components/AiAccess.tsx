@@ -1,6 +1,6 @@
 import type { BridgeStatus } from "@freeappstore/sdk/bridge";
 
-const DESKTOP_URL = "https://github.com/freeappstore-online/platform/tree/main/desktop#readme";
+const DESKTOP_URL = "https://freeappstore.online/download";
 
 const STATUS: Record<BridgeStatus, { label: string; dot: string }> = {
   off: { label: "Off", dot: "var(--color-muted)" },
