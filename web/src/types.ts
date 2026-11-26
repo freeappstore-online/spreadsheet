@@ -23,6 +23,10 @@ export interface Sheet {
   conditionalRules?: ConditionalRule[];
   colCount: number;
   rowCount: number;
+  /** Custom column widths in px by column index; missing means the default. */
+  colWidths?: Record<number, number>;
+  /** Custom row heights in px by row index; missing means the default. */
+  rowHeights?: Record<number, number>;
 }
 
 export interface WorkbookData {

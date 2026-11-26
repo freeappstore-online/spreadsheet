@@ -6,7 +6,7 @@ const isError = (val: string) => val.startsWith("#");
 
 export function Grid({ s }: { s: SpreadsheetState }) {
   const totalW = s.HEADER_WIDTH + Array.from({ length: s.sheet.colCount }, (_, c) => s.getColWidth(c)).reduce((a, b) => a + b, 0);
-  const totalH = (s.sheet.rowCount + 1) * s.ROW_HEIGHT;
+  const totalH = s.totalHeight;
   const findSet = new Set(s.findMatches);
   const currentMatch = s.findMatches[s.findIndex];
 
@@ -22,7 +22,7 @@ export function Grid({ s }: { s: SpreadsheetState }) {
       const x = ev.clientX - rect.left + gridEl.scrollLeft;
       const y = ev.clientY - rect.top + gridEl.scrollTop;
       if (y < s.ROW_HEIGHT || x < s.HEADER_WIDTH) return;
-      const r = Math.floor((y - s.ROW_HEIGHT) / s.ROW_HEIGHT);
+      const r = s.rowAtY(y);
       let cx = s.HEADER_WIDTH;
       let c = 0;
       for (; c < s.sheet.colCount; c++) {
@@ -153,7 +153,7 @@ export function Grid({ s }: { s: SpreadsheetState }) {
             ? r >= s.selectionRange.minR && r <= s.selectionRange.maxR
             : parseCellRef(s.selectedCell)?.row === r;
           return (
-            <div key={r} style={{ position: "absolute", top: (r + 1) * s.ROW_HEIGHT, left: 0, height: s.ROW_HEIGHT, display: "flex", width: totalW }}>
+            <div key={r} style={{ position: "absolute", top: s.rowTop(r), left: 0, height: s.getRowHeight(r), display: "flex", width: totalW }}>
               <div
                 onMouseDown={(e) => {
                   if (e.button !== 0) return;
@@ -179,6 +179,11 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                 }}
               >
                 {r + 1}
+                <div
+                  onMouseDown={(e) => s.handleRowResizeStart(r, e)}
+                  onDoubleClick={() => s.handleRowResizeDoubleClick(r)}
+                  style={{ position: "absolute", left: 0, right: 0, bottom: -2, height: 5, cursor: "row-resize", zIndex: 4 }}
+                />
               </div>
               {Array.from({ length: s.sheet.colCount }, (_, c) => {
                 const id = cellId(c, r);
@@ -237,7 +242,7 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                       />
                     ) : (
                       <div style={{
-                        padding: "0 4px", fontSize: "0.8125rem", lineHeight: `${s.ROW_HEIGHT}px`,
+                        padding: "0 4px", fontSize: "0.8125rem", lineHeight: `${s.getRowHeight(r)}px`,
                         overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                         color: isError(display) ? "#d94040" : cond?.color ?? fmt?.color ?? "var(--color-ink)",
                         textAlign: fmt?.align ?? (isNum ? "right" : "left"),
@@ -272,7 +277,7 @@ export function Grid({ s }: { s: SpreadsheetState }) {
             ? r >= s.selectionRange.minR && r <= s.selectionRange.maxR
             : parseCellRef(s.selectedCell)?.row === r;
           return (
-            <div key={`frozen-${r}`} style={{ position: "sticky", top: s.ROW_HEIGHT * (r + 1), zIndex: 9, height: s.ROW_HEIGHT, display: "flex", width: totalW, marginTop: -s.ROW_HEIGHT }}>
+            <div key={`frozen-${r}`} style={{ position: "sticky", top: s.rowTop(r), zIndex: 9, height: s.getRowHeight(r), display: "flex", width: totalW, marginTop: -s.getRowHeight(r) }}>
               <div style={{
                 position: "sticky", left: 0, zIndex: 1, width: s.HEADER_WIDTH, flexShrink: 0,
                 display: "flex", alignItems: "center", justifyContent: "center",
@@ -284,6 +289,11 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                 userSelect: "none",
               }}>
                 {r + 1}
+                <div
+                  onMouseDown={(e) => s.handleRowResizeStart(r, e)}
+                  onDoubleClick={() => s.handleRowResizeDoubleClick(r)}
+                  style={{ position: "absolute", left: 0, right: 0, bottom: -2, height: 5, cursor: "row-resize", zIndex: 4 }}
+                />
               </div>
               {Array.from({ length: s.sheet.colCount }, (_, c) => {
                 const id = cellId(c, r);
@@ -319,7 +329,7 @@ export function Grid({ s }: { s: SpreadsheetState }) {
                     }}
                   >
                     <div style={{
-                      padding: "0 4px", fontSize: "0.8125rem", lineHeight: `${s.ROW_HEIGHT}px`,
+                      padding: "0 4px", fontSize: "0.8125rem", lineHeight: `${s.getRowHeight(r)}px`,
                       overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                       color: isError(display) ? "#d94040" : cond?.color ?? fmt?.color ?? "var(--color-ink)",
                       textAlign: fmt?.align ?? (isNum ? "right" : "left"),
@@ -339,7 +349,7 @@ export function Grid({ s }: { s: SpreadsheetState }) {
         {s.editingRow !== null && (s.editingRow < s.startRow || s.editingRow > s.endRow) && (() => {
           const r = s.editingRow;
           return (
-            <div key={`edit-${r}`} style={{ position: "absolute", top: (r + 1) * s.ROW_HEIGHT, left: 0, height: s.ROW_HEIGHT, display: "flex", width: totalW }}>
+            <div key={`edit-${r}`} style={{ position: "absolute", top: s.rowTop(r), left: 0, height: s.getRowHeight(r), display: "flex", width: totalW }}>
               <div style={{ position: "sticky", left: 0, zIndex: 1, width: s.HEADER_WIDTH, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "var(--color-panel)", borderBottom: "1px solid var(--color-line)", borderRight: "1px solid var(--color-line)", fontSize: "0.6875rem", color: "var(--color-muted)", userSelect: "none" }}>
                 {r + 1}
               </div>

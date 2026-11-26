@@ -6,6 +6,7 @@ import { computeDisplay } from "../lib/formula-engine";
 import { parseCsvLine } from "../lib/csv";
 import { isRefPosition, buildRefString, splice } from "../lib/point-mode";
 import { makeSheet, loadWorkbook, saveWorkbook } from "../lib/persistence";
+import { rowAt, rowOffsets, setSize, shiftSizes } from "../lib/sizes";
 import { checkSheetName, clearCells, findSheetIndex, readRange, rectToA1, usedRange, writeCells } from "../lib/ai-tools";
 
 export function useSpreadsheet() {
@@ -27,7 +28,6 @@ export function useSpreadsheet() {
   const [formulaBarFocused, setFormulaBarFocused] = useState(false);
   const [pointMode, setPointMode] = useState<PointMode | null>(null);
   const [clipboard, setClipboard] = useState<{ type: "copy" | "cut"; ids: string[]; values: Record<string, string> } | null>(null);
-  const [colWidths, setColWidths] = useState<Record<number, number>>({});
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; cellId: string; type?: "cell" | "col" | "row" } | null>(null);
   const [findBar, setFindBar] = useState<{ open: boolean; query: string; replace: string; showReplace: boolean }>({ open: false, query: "", replace: "", showReplace: false });
   const [showHelp, setShowHelp] = useState(false);
@@ -43,7 +43,6 @@ export function useSpreadsheet() {
   const gridRef = useRef<HTMLDivElement>(null);
   const findInputRef = useRef<HTMLInputElement>(null);
   const pendingCursorPos = useRef<number | null>(null);
-  const resizingCol = useRef<{ col: number; startX: number; startW: number } | null>(null);
   const undoStackRef = useRef<{ cells: Record<string, string>; formats: Record<string, CellFormat> }[]>([]);
   const redoStackRef = useRef<{ cells: Record<string, string>; formats: Record<string, CellFormat> }[]>([]);
 
@@ -539,7 +538,7 @@ export function useSpreadsheet() {
     pushUndo();
     setSheet((prev) => {
       const shift = (p: { col: number; row: number }) => p.row >= targetRow ? cellId(p.col, p.row + 1) : cellId(p.col, p.row);
-      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), rowCount: prev.rowCount + 1 };
+      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), rowHeights: shiftSizes(prev.rowHeights, targetRow, 1), rowCount: prev.rowCount + 1 };
     });
   }, [pushUndo, setSheet, shiftEntries]);
 
@@ -547,7 +546,7 @@ export function useSpreadsheet() {
     pushUndo();
     setSheet((prev) => {
       const shift = (p: { col: number; row: number }) => p.row === row ? null : p.row > row ? cellId(p.col, p.row - 1) : cellId(p.col, p.row);
-      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), rowCount: Math.max(1, prev.rowCount - 1) };
+      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), rowHeights: shiftSizes(prev.rowHeights, row, -1), rowCount: Math.max(1, prev.rowCount - 1) };
     });
   }, [pushUndo, setSheet, shiftEntries]);
 
@@ -556,7 +555,7 @@ export function useSpreadsheet() {
     pushUndo();
     setSheet((prev) => {
       const shift = (p: { col: number; row: number }) => p.col >= targetCol ? cellId(p.col + 1, p.row) : cellId(p.col, p.row);
-      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), colCount: prev.colCount + 1 };
+      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), colWidths: shiftSizes(prev.colWidths, targetCol, 1), colCount: prev.colCount + 1 };
     });
   }, [pushUndo, setSheet, shiftEntries]);
 
@@ -564,7 +563,7 @@ export function useSpreadsheet() {
     pushUndo();
     setSheet((prev) => {
       const shift = (p: { col: number; row: number }) => p.col === col ? null : p.col > col ? cellId(p.col - 1, p.row) : cellId(p.col, p.row);
-      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), colCount: Math.max(1, prev.colCount - 1) };
+      return { ...prev, cells: shiftEntries(prev.cells, shift), formats: shiftEntries(prev.formats, shift), colWidths: shiftSizes(prev.colWidths, col, -1), colCount: Math.max(1, prev.colCount - 1) };
     });
   }, [pushUndo, setSheet, shiftEntries]);
 
@@ -1040,31 +1039,39 @@ export function useSpreadsheet() {
     };
   }, [aiEditCells, commitWorkbook]);
 
-  // ── Column resize ───────────────────────────────────────────────────
+  // ── Column / row resize (saved per sheet) ────────────────────────
 
-  const getColWidth = useCallback((c: number) => colWidths[c] ?? COL_WIDTH, [colWidths]);
+  const getColWidth = useCallback((c: number) => sheet.colWidths?.[c] ?? COL_WIDTH, [sheet.colWidths]);
+  const getRowHeight = useCallback((r: number) => sheet.rowHeights?.[r] ?? ROW_HEIGHT, [sheet.rowHeights]);
+  const offsets = useMemo(() => rowOffsets(sheet.rowHeights, sheet.rowCount, ROW_HEIGHT), [sheet.rowHeights, sheet.rowCount]);
+  /** Top of row `r` inside the grid, below the column header. */
+  const rowTop = useCallback((r: number) => ROW_HEIGHT + offsets[r]!, [offsets]);
+  /** The row at grid position `y` (including the column header). */
+  const rowAtY = useCallback((y: number) => rowAt(offsets, y - ROW_HEIGHT), [offsets]);
+  const totalHeight = ROW_HEIGHT + offsets[sheet.rowCount]!;
 
-  const handleColResizeStart = useCallback((col: number, e: React.MouseEvent) => {
+  const startResize = useCallback((axis: "col" | "row", index: number, e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    const startX = e.clientX;
-    const startW = colWidths[col] ?? COL_WIDTH;
-    resizingCol.current = { col, startX, startW };
-
+    const start = axis === "col" ? e.clientX : e.clientY;
+    const startSize = axis === "col" ? getColWidth(index) : getRowHeight(index);
+    const min = axis === "col" ? 40 : 20;
     const onMove = (ev: MouseEvent) => {
-      if (!resizingCol.current) return;
-      const diff = ev.clientX - resizingCol.current.startX;
-      const newW = Math.max(40, resizingCol.current.startW + diff);
-      setColWidths((prev) => ({ ...prev, [resizingCol.current!.col]: newW }));
+      const size = Math.max(min, Math.round(startSize + (axis === "col" ? ev.clientX : ev.clientY) - start));
+      setSheet((prev) => axis === "col"
+        ? { ...prev, colWidths: setSize(prev.colWidths, index, size) }
+        : { ...prev, rowHeights: setSize(prev.rowHeights, index, size) });
     };
     const onUp = () => {
-      resizingCol.current = null;
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
-  }, [colWidths]);
+  }, [getColWidth, getRowHeight, setSheet]);
+
+  const handleColResizeStart = useCallback((col: number, e: React.MouseEvent) => startResize("col", col, e), [startResize]);
+  const handleRowResizeStart = useCallback((row: number, e: React.MouseEvent) => startResize("row", row, e), [startResize]);
 
   const handleColResizeDoubleClick = useCallback((col: number) => {
     let maxW = 50;
@@ -1073,8 +1080,13 @@ export function useSpreadsheet() {
       const d = displayValues[id] ?? "";
       maxW = Math.max(maxW, d.length * 8 + 16);
     }
-    setColWidths((prev) => ({ ...prev, [col]: Math.min(maxW, 400) }));
-  }, [sheet.rowCount, displayValues]);
+    setSheet((prev) => ({ ...prev, colWidths: setSize(prev.colWidths, col, Math.min(maxW, 400)) }));
+  }, [sheet.rowCount, displayValues, setSheet]);
+
+  /** Double-clicking a row's bottom edge puts it back to the default height. */
+  const handleRowResizeDoubleClick = useCallback((row: number) => {
+    setSheet((prev) => ({ ...prev, rowHeights: setSize(prev.rowHeights, row, null) }));
+  }, [setSheet]);
 
   // ── CSV export / import ──────────────────────────────────────────────
 
@@ -1177,10 +1189,10 @@ export function useSpreadsheet() {
   const [gridHeight, setGridHeight] = useState(600);
   const BUFFER = 5;
 
-  const firstVisible = Math.floor(scrollTop / ROW_HEIGHT);
-  const visibleCount = Math.ceil(gridHeight / ROW_HEIGHT);
+  const firstVisible = rowAt(offsets, scrollTop);
+  const lastVisible = rowAt(offsets, scrollTop + gridHeight);
   const startRow = Math.max(0, firstVisible - BUFFER);
-  const endRow = Math.min(sheet.rowCount - 1, firstVisible + visibleCount + BUFFER);
+  const endRow = Math.min(sheet.rowCount - 1, lastVisible + BUFFER);
 
   // Always include the editing row in the rendered range
   const editingRow = editingCell ? (parseCellRef(editingCell)?.row ?? null) : null;
@@ -1204,13 +1216,13 @@ export function useSpreadsheet() {
   useEffect(() => {
     const parsed = parseCellRef(selectedCell);
     if (!parsed || !gridRef.current) return;
-    const cellTop = (parsed.row + 1) * ROW_HEIGHT;
-    const cellBottom = cellTop + ROW_HEIGHT;
+    const cellTop = rowTop(parsed.row);
+    const cellBottom = cellTop + getRowHeight(parsed.row);
     const viewTop = gridRef.current.scrollTop + ROW_HEIGHT;
     const viewBottom = gridRef.current.scrollTop + gridHeight;
     if (cellTop < viewTop) gridRef.current.scrollTop = cellTop - ROW_HEIGHT;
     else if (cellBottom > viewBottom) gridRef.current.scrollTop = cellBottom - gridHeight;
-  }, [selectedCell, gridHeight]);
+  }, [selectedCell, gridHeight, rowTop, getRowHeight]);
 
   // ── Formula bar change handler ──────────────────────────────────────
 
@@ -1294,6 +1306,8 @@ export function useSpreadsheet() {
     handleGridScroll,
     handleColResizeStart,
     handleColResizeDoubleClick,
+    handleRowResizeStart,
+    handleRowResizeDoubleClick,
     handleFormulaBarChange,
     handleFormulaBarFocus,
     handleFormulaBarBlur,
@@ -1301,6 +1315,10 @@ export function useSpreadsheet() {
     startEditing,
     select,
     getColWidth,
+    getRowHeight,
+    rowTop,
+    rowAtY,
+    totalHeight,
     formatDisplay,
 
     // Actions
